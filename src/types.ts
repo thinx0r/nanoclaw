@@ -55,6 +55,11 @@ export interface NewMessage {
   reply_to_message_id?: string;
   reply_to_message_content?: string;
   reply_to_sender_name?: string;
+  /** Attached images (ephemeral — not stored in DB, consumed by onMessage handler) */
+  images?: Array<{
+    media_type: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+    data: string; // base64-encoded
+  }>;
 }
 
 export interface ScheduledTask {
@@ -93,6 +98,8 @@ export interface Channel {
   disconnect(): Promise<void>;
   // Optional: typing indicator. Channels that support it implement it.
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  // Optional: add emoji reaction to a specific message (messageId = platform message timestamp/id).
+  addReaction?(jid: string, messageId: string, emoji: string): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
 }

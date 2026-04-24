@@ -60,6 +60,9 @@ interface SDKUserMessage {
   session_id: string;
 }
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
@@ -469,6 +472,12 @@ async function runQuery(
         'Skill',
         'NotebookEdit',
         'mcp__nanoclaw__*',
+        'mcp__clickup__*',
+        'mcp__slack__*',
+        'mcp__openai__*',
+        'mcp__meta__*',
+        'mcp__fleet_memory__*',
+        'mcp__drive_sync__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -480,9 +489,39 @@ async function runQuery(
           args: [mcpServerPath],
           env: {
             NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder, NO_PROXY: "api.clickup.com",
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
+        },
+        clickup: {
+          command: 'node',
+          args: [path.join(__dirname, 'clickup-mcp.js')],
+          env: { CLICKUP_TOKEN: process.env.CLICKUP_TOKEN || (() => { try { return fs.readFileSync(`/workspace/extra/patchbox/.mcp-secrets/${containerInput.groupFolder}/clickup-token`, 'utf8').trim(); } catch { return ''; } })(), NANOCLAW_GROUP_FOLDER: containerInput.groupFolder, NO_PROXY: "api.clickup.com" },
+        },
+        slack: {
+          command: 'node',
+          args: [path.join(__dirname, 'slack-mcp.js')],
+          env: { SLACK_BOT_TOKEN: process.env.SLACK_BOT_TOKEN || (() => { try { return fs.readFileSync(`/workspace/extra/patchbox/.mcp-secrets/${containerInput.groupFolder}/slack-token`, 'utf8').trim(); } catch { return ''; } })(), SLACK_CHANNEL_JID: containerInput.chatJid, NANOCLAW_GROUP_FOLDER: containerInput.groupFolder, NO_PROXY: "api.clickup.com" },
+        },
+        openai: {
+          command: 'node',
+          args: [path.join(__dirname, 'openai-mcp.js')],
+          env: { OPENAI_API_KEY: (() => { try { return fs.readFileSync(`/workspace/extra/patchbox/.mcp-secrets/${containerInput.groupFolder}/openai-token`, 'utf8').trim(); } catch { return ''; } })(), NANOCLAW_GROUP_FOLDER: containerInput.groupFolder, NO_PROXY: "api.clickup.com" },
+        },
+        meta: {
+          command: 'node',
+          args: [path.join(__dirname, 'meta-ads-mcp.js')],
+          env: { META_ADS_TOKEN: (() => { try { return fs.readFileSync(`/workspace/extra/patchbox/.mcp-secrets/${containerInput.groupFolder}/meta-ads-token`, 'utf8').trim(); } catch { return ''; } })(), NANOCLAW_GROUP_FOLDER: containerInput.groupFolder, NO_PROXY: "api.clickup.com" },
+        },
+        fleet_memory: {
+          command: 'node',
+          args: ['--experimental-sqlite', path.join(__dirname, 'fleet-memory-mcp.js')],
+          env: { ASSISTANT_NAME: containerInput.assistantName || process.env.ASSISTANT_NAME || '', NANOCLAW_GROUP_FOLDER: containerInput.groupFolder, NO_PROXY: "api.clickup.com" },
+        },
+        drive_sync: {
+          command: 'node',
+          args: [path.join(__dirname, 'drive-sync-mcp.js')],
+          env: { ASSISTANT_NAME: containerInput.assistantName || process.env.ASSISTANT_NAME || '', NANOCLAW_GROUP_FOLDER: containerInput.groupFolder, NO_PROXY: "api.clickup.com" },
         },
       },
       hooks: {
@@ -628,7 +667,6 @@ async function main(): Promise<void> {
     CLAUDE_CODE_AUTO_COMPACT_WINDOW: '165000',
   };
 
-  const __dirname = path.dirname(fileURLToPath(import.meta.url));
   const mcpServerPath = path.join(__dirname, 'ipc-mcp-stdio.js');
 
   let sessionId = containerInput.sessionId;

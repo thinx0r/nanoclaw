@@ -1,3 +1,5 @@
+import https from 'https';
+
 import { App, LogLevel } from '@slack/bolt';
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
 
@@ -22,6 +24,21 @@ const MAX_MESSAGE_LENGTH = 4000;
 // (BotMessageEvent, subtype 'bot_message') so we can track our own output.
 type HandledMessageEvent = GenericMessageEvent | BotMessageEvent;
 
+// Slack file attachment shape (subset we care about)
+interface SlackFile {
+  url_private?: string;
+  mimetype?: string;
+  id?: string;
+}
+
+type ValidImageMime = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
+const VALID_IMAGE_MIMES: ReadonlyArray<ValidImageMime> = [
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+];
+
 export interface SlackChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
@@ -32,6 +49,7 @@ export class SlackChannel implements Channel {
   name = 'slack';
 
   private app: App;
+  private botToken = '';
   private botUserId: string | undefined;
   private connected = false;
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
@@ -55,6 +73,9 @@ export class SlackChannel implements Channel {
       );
     }
 
+    // Store bot token so we can authenticate file download requests
+    this.botToken = botToken;
+
     this.app = new App({
       token: botToken,
       appToken,
@@ -77,7 +98,11 @@ export class SlackChannel implements Channel {
       // After filtering, event is either GenericMessageEvent or BotMessageEvent
       const msg = event as HandledMessageEvent;
 
-      if (!msg.text) return;
+      // Extract file attachments (images) if present
+      const rawFiles = (msg as unknown as { files?: SlackFile[] }).files;
+
+      // Drop messages that have neither text nor image files
+      if (!msg.text && !rawFiles?.length) return;
 
       // Threaded replies are flattened into the channel conversation.
       // The agent sees them alongside channel-level messages; responses
@@ -94,8 +119,8 @@ export class SlackChannel implements Channel {
       const groups = this.opts.registeredGroups();
       if (!groups[jid]) return;
 
-      const isBotMessage =
-        !!msg.bot_id || msg.user === this.botUserId;
+      const isFromMe = msg.user === this.botUserId;
+      const isBotMessage = !!msg.bot_id || isFromMe;
 
       let senderName: string;
       if (isBotMessage) {
@@ -110,13 +135,22 @@ export class SlackChannel implements Channel {
       // Translate Slack <@UBOTID> mentions into TRIGGER_PATTERN format.
       // Slack encodes @mentions as <@U12345>, which won't match TRIGGER_PATTERN
       // (e.g., ^@<ASSISTANT_NAME>\b), so we prepend the trigger when the bot is @mentioned.
-      let content = msg.text;
-      if (this.botUserId && !isBotMessage) {
+      let content = msg.text || '';
+      if (this.botUserId) {
         const mentionPattern = `<@${this.botUserId}>`;
-        if (content.includes(mentionPattern) && !TRIGGER_PATTERN.test(content)) {
+        if (
+          content.includes(mentionPattern) &&
+          !TRIGGER_PATTERN.test(content)
+        ) {
           content = `@${ASSISTANT_NAME} ${content}`;
         }
       }
+
+      // Download image attachments (non-blocking; failures are soft-logged)
+      const images =
+        rawFiles?.length && !isBotMessage
+          ? await this.extractImages(rawFiles)
+          : undefined;
 
       this.opts.onMessage(jid, {
         id: msg.ts,
@@ -125,10 +159,74 @@ export class SlackChannel implements Channel {
         sender_name: senderName,
         content,
         timestamp,
-        is_from_me: isBotMessage,
+        is_from_me: isFromMe,
         is_bot_message: isBotMessage,
+        ...(images ? { images } : {}),
       });
     });
+  }
+
+  /**
+   * Download a private Slack file and return it as a base64-encoded Buffer.
+   * Uses the bot token for authorization (Slack requires it for url_private URLs).
+   */
+  private downloadFile(url: string): Promise<Buffer | undefined> {
+    return new Promise((resolve) => {
+      const req = https.get(
+        url,
+        { headers: { Authorization: `Bearer ${this.botToken}` } },
+        (res) => {
+          if (res.statusCode !== 200) {
+            res.resume(); // discard response body
+            resolve(undefined);
+            return;
+          }
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer) => chunks.push(chunk));
+          res.on('end', () => resolve(Buffer.concat(chunks)));
+          res.on('error', () => resolve(undefined));
+        },
+      );
+      req.on('error', (err) => {
+        logger.debug({ url, err }, 'Slack file download request error');
+        resolve(undefined);
+      });
+    });
+  }
+
+  /**
+   * Extract supported image attachments from a Slack message.
+   * Downloads each image and returns it as a base64-encoded data block.
+   */
+  private async extractImages(
+    files: SlackFile[],
+  ): Promise<
+    Array<{ media_type: ValidImageMime; data: string }> | undefined
+  > {
+    const results: Array<{ media_type: ValidImageMime; data: string }> = [];
+
+    for (const file of files) {
+      if (!file.url_private || !file.mimetype) continue;
+      if (!VALID_IMAGE_MIMES.includes(file.mimetype as ValidImageMime))
+        continue;
+
+      try {
+        const buf = await this.downloadFile(file.url_private);
+        if (!buf) continue;
+        results.push({
+          media_type: file.mimetype as ValidImageMime,
+          data: buf.toString('base64'),
+        });
+        logger.debug(
+          { fileId: file.id, bytes: buf.length },
+          'Slack image downloaded',
+        );
+      } catch (err) {
+        logger.debug({ fileId: file.id, err }, 'Failed to download Slack image');
+      }
+    }
+
+    return results.length > 0 ? results : undefined;
   }
 
   async connect(): Promise<void> {
@@ -142,10 +240,7 @@ export class SlackChannel implements Channel {
       this.botUserId = auth.user_id as string;
       logger.info({ botUserId: this.botUserId }, 'Connected to Slack');
     } catch (err) {
-      logger.warn(
-        { err },
-        'Connected to Slack but failed to get bot user ID',
-      );
+      logger.warn({ err }, 'Connected to Slack but failed to get bot user ID');
     }
 
     this.connected = true;
@@ -211,6 +306,11 @@ export class SlackChannel implements Channel {
     // no-op: Slack Bot API has no typing indicator endpoint
   }
 
+  async addReaction(jid: string, messageId: string, emoji: string): Promise<void> {
+    const channel = jid.replace('slack:', '');
+    await this.app.client.reactions.add({ channel, name: emoji, timestamp: messageId });
+  }
+
   /**
    * Sync channel metadata from Slack.
    * Fetches channels the bot is a member of and stores their names in the DB.
@@ -245,9 +345,7 @@ export class SlackChannel implements Channel {
     }
   }
 
-  private async resolveUserName(
-    userId: string,
-  ): Promise<string | undefined> {
+  private async resolveUserName(userId: string): Promise<string | undefined> {
     if (!userId) return undefined;
 
     const cached = this.userNameCache.get(userId);

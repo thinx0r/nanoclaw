@@ -47,7 +47,7 @@ import {
   storeMessage,
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
-import { resolveGroupFolderPath } from './group-folder.js';
+import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
 import { findChannel, formatMessages, formatOutbound } from './router.js';
 import {
@@ -662,7 +662,43 @@ async function main(): Promise<void> {
           return;
         }
       }
+      // Save image attachments to the group's IPC dir so the container can read them.
+      // Paths are appended to msg.content as text references; the agent uses the
+      // Read tool to view the files (no agent-runner changes needed).
+      if (msg.images?.length) {
+        const imgGroup = registeredGroups[chatJid];
+        if (imgGroup) {
+          const ipcDir = resolveGroupIpcPath(imgGroup.folder);
+          const imagesDir = path.join(ipcDir, 'input', 'images');
+          try {
+            fs.mkdirSync(imagesDir, { recursive: true });
+            const paths: string[] = [];
+            for (let i = 0; i < msg.images.length; i++) {
+              const img = msg.images[i];
+              const ext = img.media_type.split('/')[1] || 'png';
+              const filename = `${msg.id}_${i}.${ext}`;
+              fs.writeFileSync(
+                path.join(imagesDir, filename),
+                Buffer.from(img.data, 'base64'),
+              );
+              paths.push(`/workspace/ipc/input/images/${filename}`);
+            }
+            if (paths.length > 0) {
+              msg.content =
+                (msg.content ? msg.content + '\n' : '') +
+                paths.map((p) => `[Attached image: ${p}]`).join('\n');
+            }
+          } catch (err) {
+            logger.warn({ err, chatJid }, 'Failed to save Slack image attachment');
+          }
+        }
+      }
       storeMessage(msg);
+      if (!msg.is_from_me) {
+        findChannel(channels, chatJid)
+          ?.addReaction?.(chatJid, msg.id, 'eyes')
+          .catch((err) => logger.warn({ err, chatJid }, 'Failed to add seen reaction'));
+      }
     },
     onChatMetadata: (
       chatJid: string,
