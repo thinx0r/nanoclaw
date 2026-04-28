@@ -29,6 +29,7 @@ interface SlackFile {
   url_private?: string;
   mimetype?: string;
   id?: string;
+  name?: string;
 }
 
 type ValidImageMime = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
@@ -37,6 +38,14 @@ const VALID_IMAGE_MIMES: ReadonlyArray<ValidImageMime> = [
   'image/png',
   'image/gif',
   'image/webp',
+];
+
+type ValidDocumentMime = 'application/pdf' | 'text/plain' | 'text/markdown' | 'text/x-markdown';
+const VALID_DOCUMENT_MIMES: ReadonlyArray<ValidDocumentMime> = [
+  'application/pdf',
+  'text/plain',
+  'text/markdown',
+  'text/x-markdown',
 ];
 
 export interface SlackChannelOpts {
@@ -55,6 +64,7 @@ export class SlackChannel implements Channel {
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private userNameCache = new Map<string, string>();
+  private fileSenderAllowlist: string[] = [];
 
   private opts: SlackChannelOpts;
 
@@ -63,9 +73,17 @@ export class SlackChannel implements Channel {
 
     // Read tokens from .env (not process.env — keeps secrets off the environment
     // so they don't leak to child processes, matching NanoClaw's security pattern)
-    const env = readEnvFile(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN']);
+    const env = readEnvFile(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'FILE_SENDER_ALLOWLIST']);
     const botToken = env.SLACK_BOT_TOKEN;
     const appToken = env.SLACK_APP_TOKEN;
+
+    // Optional: comma-separated Slack user IDs allowed to send file attachments.
+    // If empty/unset, all senders may share files. Set in .env as FILE_SENDER_ALLOWLIST=U123,U456.
+    if (env.FILE_SENDER_ALLOWLIST) {
+      this.fileSenderAllowlist = env.FILE_SENDER_ALLOWLIST.split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+    }
 
     if (!botToken || !appToken) {
       throw new Error(
@@ -86,14 +104,92 @@ export class SlackChannel implements Channel {
     this.setupEventHandlers();
   }
 
+  // Reactions that count as approval decisions. Deliberately narrow —
+  // 👀 / ⚙️ / 🔍 etc. are bot housekeeping and must not trigger approvals.
+  private static readonly APPROVAL_REACTIONS = new Set([
+    'white_check_mark', // ✅
+    'heavy_check_mark', // ✔️
+    'x',                // ❌
+    'no_entry_sign',    // 🚫
+  ]);
+
   private setupEventHandlers(): void {
+    // reaction_added — approval-via-reaction: user reacts ✅ or ❌ to a bot message
+    this.app.event('reaction_added', async ({ event }) => {
+      const ev = event as unknown as {
+        user: string;
+        reaction: string;
+        item: { type: string; channel: string; ts: string };
+        item_user?: string;
+        event_ts: string;
+      };
+
+      // Only message reactions (not file or channel reactions)
+      if (ev.item.type !== 'message') return;
+
+      // Ignore the bot's own housekeeping reactions (👀, ⚙️, ✅ it adds itself)
+      if (ev.user === this.botUserId) return;
+
+      // Only approval-relevant reactions
+      if (!SlackChannel.APPROVAL_REACTIONS.has(ev.reaction)) return;
+
+      const jid = `slack:${ev.item.channel}`;
+
+      // Only for registered groups
+      const groups = this.opts.registeredGroups();
+      if (!groups[jid]) return;
+
+      // Only react to messages posted by this bot
+      // (item_user may be absent in edge cases — process conservatively)
+      if (ev.item_user && ev.item_user !== this.botUserId) return;
+
+      const senderName = (await this.resolveUserName(ev.user)) || ev.user;
+      const timestamp = new Date(parseFloat(ev.event_ts) * 1000).toISOString();
+
+      // Fetch the original message text so the agent knows which approval request
+      // is being acted on without needing a separate Slack MCP call.
+      let originalSnippet = '';
+      try {
+        const history = await this.app.client.conversations.history({
+          channel: ev.item.channel,
+          latest: ev.item.ts,
+          oldest: ev.item.ts,
+          inclusive: true,
+          limit: 1,
+        });
+        const text = (history.messages as Array<{ text?: string }>)?.[0]?.text;
+        if (text) originalSnippet = text.slice(0, 300);
+      } catch {
+        // non-critical — agent can look up by ts if needed
+      }
+
+      const content =
+        `@${ASSISTANT_NAME} [Reaction: :${ev.reaction}: from ${senderName} (${ev.user}) on message ts=${ev.item.ts}]` +
+        (originalSnippet ? `\nOriginal message: ${originalSnippet}` : '');
+
+      logger.debug({ jid, reaction: ev.reaction, user: ev.user }, 'Reaction-based approval received');
+
+      this.opts.onMessage(jid, {
+        id: ev.event_ts,
+        chat_jid: jid,
+        sender: ev.user,
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+        is_bot_message: false,
+      });
+    });
+
     // Use app.event('message') instead of app.message() to capture all
     // message subtypes including bot_message (needed to track our own output)
     this.app.event('message', async ({ event }) => {
       // Bolt's event type is the full MessageEvent union (17+ subtypes).
       // We filter on subtype first, then narrow to the two types we handle.
       const subtype = (event as { subtype?: string }).subtype;
-      if (subtype && subtype !== 'bot_message') return;
+      // Allow regular messages (no subtype), bot messages, and file shares.
+      // All other subtypes (message_changed, message_deleted, etc.) are noise.
+      if (subtype && subtype !== 'bot_message' && subtype !== 'file_share') return;
 
       // After filtering, event is either GenericMessageEvent or BotMessageEvent
       const msg = event as HandledMessageEvent;
@@ -104,10 +200,6 @@ export class SlackChannel implements Channel {
       // Drop messages that have neither text nor image files
       if (!msg.text && !rawFiles?.length) return;
 
-      // Threaded replies are flattened into the channel conversation.
-      // The agent sees them alongside channel-level messages; responses
-      // always go to the channel, not back into the thread.
-
       const jid = `slack:${msg.channel}`;
       const timestamp = new Date(parseFloat(msg.ts) * 1000).toISOString();
       const isGroup = msg.channel_type !== 'im';
@@ -115,12 +207,63 @@ export class SlackChannel implements Channel {
       // Always report metadata for group discovery
       this.opts.onChatMetadata(jid, timestamp, undefined, 'slack', isGroup);
 
-      // Only deliver full messages for registered groups
-      const groups = this.opts.registeredGroups();
-      if (!groups[jid]) return;
-
+      // Compute sender and mention data before the group check so they can
+      // be used for cross-channel routing below.
       const isFromMe = msg.user === this.botUserId;
       const isBotMessage = !!msg.bot_id || isFromMe;
+      const senderId = msg.user || '';
+
+      // Translate Slack <@UBOTID> mentions into TRIGGER_PATTERN format.
+      let content = msg.text || '';
+      const mentionToken = this.botUserId ? `<@${this.botUserId}>` : null;
+      if (mentionToken && content.includes(mentionToken) && !TRIGGER_PATTERN.test(content)) {
+        content = `@${ASSISTANT_NAME} ${content}`;
+      }
+      // isBotMentioned is true when:
+      //   a) Slack resolves a @mention to <@BOT_ID> (human users via UI), OR
+      //   b) another agent writes literal "@BotName" (bot-to-bot via Slack MCP)
+      const isBotMentioned =
+        (!!mentionToken && (msg.text || '').includes(mentionToken)) ||
+        new RegExp(`@${ASSISTANT_NAME}\\b`, 'i').test(msg.text || '');
+
+      const groups = this.opts.registeredGroups();
+
+      if (!groups[jid]) {
+        // Cross-channel @mention routing: when this bot is explicitly mentioned
+        // in a channel it isn't registered for, route the message to the main
+        // registered group so the agent can respond.
+        //
+        // The original channel JID is prepended to the content so the agent
+        // knows where to reply (it uses its Slack MCP to post there).
+        // Bot's own messages are never re-routed (isFromMe guard).
+        if (!isFromMe && isBotMentioned) {
+          const mainEntry = Object.entries(groups).find(([, g]) => g.isMain);
+          if (mainEntry) {
+            const [mainJid] = mainEntry;
+            const senderName = msg.user
+              ? (await this.resolveUserName(msg.user)) || msg.user
+              : (msg as unknown as { username?: string }).username || 'unknown';
+            const routedContent = `[Cross-channel mention — reply in slack:${msg.channel}]\n${content}`;
+            logger.info(
+              { srcJid: jid, mainJid, sender: senderId },
+              'Routing cross-channel @mention to main group',
+            );
+            this.opts.onMessage(mainJid, {
+              id: msg.ts,
+              chat_jid: mainJid,
+              sender: senderId,
+              sender_name: senderName,
+              content: routedContent,
+              timestamp,
+              is_from_me: false,
+              is_bot_message: isBotMessage,
+            });
+          }
+        }
+        return;
+      }
+
+      // ── Registered channel: full processing ──────────────────────────────
 
       let senderName: string;
       if (isBotMessage) {
@@ -132,25 +275,29 @@ export class SlackChannel implements Channel {
           'unknown';
       }
 
-      // Translate Slack <@UBOTID> mentions into TRIGGER_PATTERN format.
-      // Slack encodes @mentions as <@U12345>, which won't match TRIGGER_PATTERN
-      // (e.g., ^@<ASSISTANT_NAME>\b), so we prepend the trigger when the bot is @mentioned.
-      let content = msg.text || '';
-      if (this.botUserId) {
-        const mentionPattern = `<@${this.botUserId}>`;
-        if (
-          content.includes(mentionPattern) &&
-          !TRIGGER_PATTERN.test(content)
-        ) {
-          content = `@${ASSISTANT_NAME} ${content}`;
-        }
+      // File attachments are only processed for non-bot messages from allowed senders.
+      const filesSenderAllowed =
+        !isBotMessage &&
+        rawFiles?.length &&
+        (this.fileSenderAllowlist.length === 0 ||
+          this.fileSenderAllowlist.includes(senderId));
+
+      if (rawFiles?.length) {
+        logger.info(
+          { fileCount: rawFiles.length, senderId, allowed: !!filesSenderAllowed, subtype },
+          'Slack message has file attachments',
+        );
       }
 
       // Download image attachments (non-blocking; failures are soft-logged)
-      const images =
-        rawFiles?.length && !isBotMessage
-          ? await this.extractImages(rawFiles)
-          : undefined;
+      const images = filesSenderAllowed
+        ? await this.extractImages(rawFiles!)
+        : undefined;
+
+      // Download PDF attachments
+      const documents = filesSenderAllowed
+        ? await this.extractDocuments(rawFiles!)
+        : undefined;
 
       this.opts.onMessage(jid, {
         id: msg.ts,
@@ -162,6 +309,7 @@ export class SlackChannel implements Channel {
         is_from_me: isFromMe,
         is_bot_message: isBotMessage,
         ...(images ? { images } : {}),
+        ...(documents ? { documents } : {}),
       });
     });
   }
@@ -177,6 +325,10 @@ export class SlackChannel implements Channel {
         { headers: { Authorization: `Bearer ${this.botToken}` } },
         (res) => {
           if (res.statusCode !== 200) {
+            logger.warn(
+              { url, statusCode: res.statusCode },
+              'Slack file download failed — likely missing files:read scope',
+            );
             res.resume(); // discard response body
             resolve(undefined);
             return;
@@ -200,9 +352,7 @@ export class SlackChannel implements Channel {
    */
   private async extractImages(
     files: SlackFile[],
-  ): Promise<
-    Array<{ media_type: ValidImageMime; data: string }> | undefined
-  > {
+  ): Promise<Array<{ media_type: ValidImageMime; data: string }> | undefined> {
     const results: Array<{ media_type: ValidImageMime; data: string }> = [];
 
     for (const file of files) {
@@ -217,12 +367,58 @@ export class SlackChannel implements Channel {
           media_type: file.mimetype as ValidImageMime,
           data: buf.toString('base64'),
         });
-        logger.debug(
+        logger.info(
           { fileId: file.id, bytes: buf.length },
           'Slack image downloaded',
         );
       } catch (err) {
-        logger.debug({ fileId: file.id, err }, 'Failed to download Slack image');
+        logger.warn(
+          { fileId: file.id, err },
+          'Failed to download Slack image',
+        );
+      }
+    }
+
+    return results.length > 0 ? results : undefined;
+  }
+
+  /**
+   * Extract document attachments (PDFs, markdown, plain text) from a Slack message.
+   * Downloads each file and returns it as a base64-encoded data block.
+   */
+  private async extractDocuments(
+    files: SlackFile[],
+  ): Promise<
+    Array<{ filename: string; data: string; mime_type: ValidDocumentMime }> | undefined
+  > {
+    const results: Array<{
+      filename: string;
+      data: string;
+      mime_type: ValidDocumentMime;
+    }> = [];
+
+    for (const file of files) {
+      if (!file.url_private || !file.mimetype) continue;
+      if (!VALID_DOCUMENT_MIMES.includes(file.mimetype as ValidDocumentMime)) continue;
+
+      try {
+        const buf = await this.downloadFile(file.url_private);
+        if (!buf) continue;
+        const filename = file.name || (file.id ? `${file.id}` : 'document');
+        results.push({
+          filename,
+          data: buf.toString('base64'),
+          mime_type: file.mimetype as ValidDocumentMime,
+        });
+        logger.info(
+          { fileId: file.id, mime: file.mimetype, bytes: buf.length },
+          'Slack document downloaded',
+        );
+      } catch (err) {
+        logger.warn(
+          { fileId: file.id, err },
+          'Failed to download Slack document',
+        );
       }
     }
 
@@ -306,9 +502,30 @@ export class SlackChannel implements Channel {
     // no-op: Slack Bot API has no typing indicator endpoint
   }
 
-  async addReaction(jid: string, messageId: string, emoji: string): Promise<void> {
+  async addReaction(
+    jid: string,
+    messageId: string,
+    emoji: string,
+  ): Promise<void> {
     const channel = jid.replace('slack:', '');
-    await this.app.client.reactions.add({ channel, name: emoji, timestamp: messageId });
+    await this.app.client.reactions.add({
+      channel,
+      name: emoji,
+      timestamp: messageId,
+    });
+  }
+
+  async removeReaction(
+    jid: string,
+    messageId: string,
+    emoji: string,
+  ): Promise<void> {
+    const channel = jid.replace('slack:', '');
+    await this.app.client.reactions.remove({
+      channel,
+      name: emoji,
+      timestamp: messageId,
+    });
   }
 
   /**
