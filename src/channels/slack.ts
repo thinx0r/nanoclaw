@@ -16,8 +16,31 @@ import {
 } from '../types.js';
 
 // Slack's chat.postMessage API limits text to ~4000 characters per call.
-// Messages exceeding this are split into sequential chunks.
+// Messages exceeding this are split into sequential chunks, with code-block
+// awareness: if a split point falls inside a triple-backtick block the block
+// is closed at the end of the chunk and reopened at the start of the next.
 const MAX_MESSAGE_LENGTH = 4000;
+const SPLIT_TARGET = 3900; // headroom for closing/reopening backticks
+
+function splitMessage(text: string): string[] {
+  if (text.length <= MAX_MESSAGE_LENGTH) return [text];
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > MAX_MESSAGE_LENGTH) {
+    let splitAt = remaining.lastIndexOf('\n', SPLIT_TARGET);
+    if (splitAt <= 0) splitAt = SPLIT_TARGET;
+    let chunk = remaining.slice(0, splitAt);
+    remaining = remaining.slice(splitAt).replace(/^\n/, '');
+    // odd number of ``` = split landed inside a code block → close & reopen
+    if ((chunk.match(/```/g) ?? []).length % 2 !== 0) {
+      chunk += '\n```';
+      remaining = '```\n' + remaining;
+    }
+    chunks.push(chunk);
+  }
+  if (remaining) chunks.push(remaining);
+  return chunks;
+}
 
 // The message subtypes we process. Bolt delivers all subtypes via app.event('message');
 // we filter to regular messages (GenericMessageEvent, subtype undefined) and bot messages
@@ -40,7 +63,11 @@ const VALID_IMAGE_MIMES: ReadonlyArray<ValidImageMime> = [
   'image/webp',
 ];
 
-type ValidDocumentMime = 'application/pdf' | 'text/plain' | 'text/markdown' | 'text/x-markdown';
+type ValidDocumentMime =
+  | 'application/pdf'
+  | 'text/plain'
+  | 'text/markdown'
+  | 'text/x-markdown';
 const VALID_DOCUMENT_MIMES: ReadonlyArray<ValidDocumentMime> = [
   'application/pdf',
   'text/plain',
@@ -73,7 +100,11 @@ export class SlackChannel implements Channel {
 
     // Read tokens from .env (not process.env — keeps secrets off the environment
     // so they don't leak to child processes, matching NanoClaw's security pattern)
-    const env = readEnvFile(['SLACK_BOT_TOKEN', 'SLACK_APP_TOKEN', 'FILE_SENDER_ALLOWLIST']);
+    const env = readEnvFile([
+      'SLACK_BOT_TOKEN',
+      'SLACK_APP_TOKEN',
+      'FILE_SENDER_ALLOWLIST',
+    ]);
     const botToken = env.SLACK_BOT_TOKEN;
     const appToken = env.SLACK_APP_TOKEN;
 
@@ -109,8 +140,8 @@ export class SlackChannel implements Channel {
   private static readonly APPROVAL_REACTIONS = new Set([
     'white_check_mark', // ✅
     'heavy_check_mark', // ✔️
-    'x',                // ❌
-    'no_entry_sign',    // 🚫
+    'x', // ❌
+    'no_entry_sign', // 🚫
   ]);
 
   private setupEventHandlers(): void {
@@ -167,7 +198,10 @@ export class SlackChannel implements Channel {
         `@${ASSISTANT_NAME} [Reaction: :${ev.reaction}: from ${senderName} (${ev.user}) on message ts=${ev.item.ts}]` +
         (originalSnippet ? `\nOriginal message: ${originalSnippet}` : '');
 
-      logger.debug({ jid, reaction: ev.reaction, user: ev.user }, 'Reaction-based approval received');
+      logger.debug(
+        { jid, reaction: ev.reaction, user: ev.user },
+        'Reaction-based approval received',
+      );
 
       this.opts.onMessage(jid, {
         id: ev.event_ts,
@@ -189,7 +223,8 @@ export class SlackChannel implements Channel {
       const subtype = (event as { subtype?: string }).subtype;
       // Allow regular messages (no subtype), bot messages, and file shares.
       // All other subtypes (message_changed, message_deleted, etc.) are noise.
-      if (subtype && subtype !== 'bot_message' && subtype !== 'file_share') return;
+      if (subtype && subtype !== 'bot_message' && subtype !== 'file_share')
+        return;
 
       // After filtering, event is either GenericMessageEvent or BotMessageEvent
       const msg = event as HandledMessageEvent;
@@ -216,7 +251,11 @@ export class SlackChannel implements Channel {
       // Translate Slack <@UBOTID> mentions into TRIGGER_PATTERN format.
       let content = msg.text || '';
       const mentionToken = this.botUserId ? `<@${this.botUserId}>` : null;
-      if (mentionToken && content.includes(mentionToken) && !TRIGGER_PATTERN.test(content)) {
+      if (
+        mentionToken &&
+        content.includes(mentionToken) &&
+        !TRIGGER_PATTERN.test(content)
+      ) {
         content = `@${ASSISTANT_NAME} ${content}`;
       }
       // isBotMentioned is true when:
@@ -284,7 +323,12 @@ export class SlackChannel implements Channel {
 
       if (rawFiles?.length) {
         logger.info(
-          { fileCount: rawFiles.length, senderId, allowed: !!filesSenderAllowed, subtype },
+          {
+            fileCount: rawFiles.length,
+            senderId,
+            allowed: !!filesSenderAllowed,
+            subtype,
+          },
           'Slack message has file attachments',
         );
       }
@@ -372,10 +416,7 @@ export class SlackChannel implements Channel {
           'Slack image downloaded',
         );
       } catch (err) {
-        logger.warn(
-          { fileId: file.id, err },
-          'Failed to download Slack image',
-        );
+        logger.warn({ fileId: file.id, err }, 'Failed to download Slack image');
       }
     }
 
@@ -389,7 +430,8 @@ export class SlackChannel implements Channel {
   private async extractDocuments(
     files: SlackFile[],
   ): Promise<
-    Array<{ filename: string; data: string; mime_type: ValidDocumentMime }> | undefined
+    | Array<{ filename: string; data: string; mime_type: ValidDocumentMime }>
+    | undefined
   > {
     const results: Array<{
       filename: string;
@@ -399,7 +441,8 @@ export class SlackChannel implements Channel {
 
     for (const file of files) {
       if (!file.url_private || !file.mimetype) continue;
-      if (!VALID_DOCUMENT_MIMES.includes(file.mimetype as ValidDocumentMime)) continue;
+      if (!VALID_DOCUMENT_MIMES.includes(file.mimetype as ValidDocumentMime))
+        continue;
 
       try {
         const buf = await this.downloadFile(file.url_private);
@@ -461,16 +504,10 @@ export class SlackChannel implements Channel {
     }
 
     try {
-      // Slack limits messages to ~4000 characters; split if needed
-      if (text.length <= MAX_MESSAGE_LENGTH) {
-        await this.app.client.chat.postMessage({ channel: channelId, text });
-      } else {
-        for (let i = 0; i < text.length; i += MAX_MESSAGE_LENGTH) {
-          await this.app.client.chat.postMessage({
-            channel: channelId,
-            text: text.slice(i, i + MAX_MESSAGE_LENGTH),
-          });
-        }
+      // Slack limits messages to ~4000 characters; split at line boundaries
+      // and preserve code-block state across chunks
+      for (const chunk of splitMessage(text)) {
+        await this.app.client.chat.postMessage({ channel: channelId, text: chunk });
       }
       logger.info({ jid, length: text.length }, 'Slack message sent');
     } catch (err) {

@@ -622,25 +622,43 @@ describe('SlackChannel', () => {
       ).resolves.toBeUndefined();
     });
 
-    it('splits long messages at 4000 character boundary', async () => {
+    it('splits long messages near the 3900-char line-boundary target', async () => {
       const opts = createTestOpts();
       const channel = new SlackChannel(opts);
       await channel.connect();
 
-      // Create a message longer than 4000 chars
+      // No newlines → falls back to hard split at SPLIT_TARGET (3900)
       const longText = 'A'.repeat(4500);
       await channel.sendMessage('slack:C0123456789', longText);
 
-      // Should be split into 2 messages: 4000 + 500
       expect(currentApp().client.chat.postMessage).toHaveBeenCalledTimes(2);
       expect(currentApp().client.chat.postMessage).toHaveBeenNthCalledWith(1, {
         channel: 'C0123456789',
-        text: 'A'.repeat(4000),
+        text: 'A'.repeat(3900),
       });
       expect(currentApp().client.chat.postMessage).toHaveBeenNthCalledWith(2, {
         channel: 'C0123456789',
-        text: 'A'.repeat(500),
+        text: 'A'.repeat(600),
       });
+    });
+
+    it('closes and reopens code blocks across split boundaries', async () => {
+      const opts = createTestOpts();
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      // Build a code-block message that spans > 4000 chars
+      const inner = ('line of content\n').repeat(280); // ~4480 chars
+      const text = '```\n' + inner + '```';
+      await channel.sendMessage('slack:C0123456789', text);
+
+      expect(currentApp().client.chat.postMessage).toHaveBeenCalledTimes(2);
+      const first = (currentApp().client.chat.postMessage as ReturnType<typeof vi.fn>).mock.calls[0][0].text as string;
+      const second = (currentApp().client.chat.postMessage as ReturnType<typeof vi.fn>).mock.calls[1][0].text as string;
+      // First chunk must end with closing backticks
+      expect(first.endsWith('```')).toBe(true);
+      // Second chunk must start with opening backticks
+      expect(second.startsWith('```')).toBe(true);
     });
 
     it('sends exactly-4000-char messages as a single message', async () => {
