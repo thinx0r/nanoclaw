@@ -40,7 +40,7 @@ vi.mock('@slack/bolt', () => ({
 
     client = {
       auth: {
-        test: vi.fn().mockResolvedValue({ user_id: 'U_BOT_123' }),
+        test: vi.fn().mockResolvedValue({ user_id: 'U_BOT_123', bot_id: 'B_BOT_123' }),
       },
       chat: {
         postMessage: vi.fn().mockResolvedValue(undefined),
@@ -286,16 +286,15 @@ describe('SlackChannel', () => {
     it('detects bot messages by bot_id', async () => {
       const opts = createTestOpts();
       const channel = new SlackChannel(opts);
-      await channel.connect();
+      await channel.connect(); // botBotId='B_BOT_123'
 
       const event = createMessageEvent({
         subtype: 'bot_message',
-        botId: 'B_MY_BOT',
+        botId: 'B_BOT_123', // own bot's ID — Slack sets bot_id but not user
         text: 'Bot response',
       });
       await triggerMessageEvent(event);
 
-      // Has bot_id so should be marked as bot message
       expect(opts.onMessage).toHaveBeenCalledWith(
         'slack:C0123456789',
         expect.objectContaining({
@@ -484,6 +483,70 @@ describe('SlackChannel', () => {
     });
   });
 
+  // --- Cross-channel routing ---
+
+  describe('cross-channel routing', () => {
+    it('routes @mention in unregistered channel to main group', async () => {
+      const opts = createTestOpts({
+        registeredGroups: vi.fn(() => ({
+          'slack:C0123456789': {
+            name: 'Main Channel',
+            folder: 'main',
+            trigger: '@Jonesy',
+            added_at: '2024-01-01T00:00:00.000Z',
+            isMain: true,
+          },
+        })),
+      });
+      const channel = new SlackChannel(opts);
+      await channel.connect();
+
+      const event = createMessageEvent({
+        channel: 'C9999999999', // not registered
+        text: '@Jonesy please help',
+        user: 'U_USER_456',
+      });
+      await triggerMessageEvent(event);
+
+      expect(opts.onMessage).toHaveBeenCalledWith(
+        'slack:C0123456789',
+        expect.objectContaining({
+          sender: 'U_USER_456',
+          is_from_me: false,
+          content: expect.stringContaining('@Jonesy please help'),
+        }),
+      );
+    });
+
+    it('does not re-route own bot message via bot_id (Blocker-157 regression)', async () => {
+      const opts = createTestOpts({
+        registeredGroups: vi.fn(() => ({
+          'slack:C0123456789': {
+            name: 'Main Channel',
+            folder: 'main',
+            trigger: '@Jonesy',
+            added_at: '2024-01-01T00:00:00.000Z',
+            isMain: true,
+          },
+        })),
+      });
+      const channel = new SlackChannel(opts);
+      await channel.connect(); // botUserId='U_BOT_123', botBotId='B_BOT_123'
+
+      // Bot's own outgoing message in an unregistered channel with a self-mention.
+      // Before the fix, isFromMe was false for bot-token messages (msg.user=undefined),
+      // causing the message to route back with sender="KIKI", triggering the self-drop rule.
+      const event = createMessageEvent({
+        channel: 'C9999999999', // unregistered — triggers routing path
+        text: '@Jonesy something',
+        botId: 'B_BOT_123', // own bot_id — no msg.user on bot-token messages
+      });
+      await triggerMessageEvent(event);
+
+      expect(opts.onMessage).not.toHaveBeenCalled();
+    });
+  });
+
   // --- @mention translation ---
 
   describe('@mention translation', () => {
@@ -648,13 +711,17 @@ describe('SlackChannel', () => {
       await channel.connect();
 
       // Build a code-block message that spans > 4000 chars
-      const inner = ('line of content\n').repeat(280); // ~4480 chars
+      const inner = 'line of content\n'.repeat(280); // ~4480 chars
       const text = '```\n' + inner + '```';
       await channel.sendMessage('slack:C0123456789', text);
 
       expect(currentApp().client.chat.postMessage).toHaveBeenCalledTimes(2);
-      const first = (currentApp().client.chat.postMessage as ReturnType<typeof vi.fn>).mock.calls[0][0].text as string;
-      const second = (currentApp().client.chat.postMessage as ReturnType<typeof vi.fn>).mock.calls[1][0].text as string;
+      const first = (
+        currentApp().client.chat.postMessage as ReturnType<typeof vi.fn>
+      ).mock.calls[0][0].text as string;
+      const second = (
+        currentApp().client.chat.postMessage as ReturnType<typeof vi.fn>
+      ).mock.calls[1][0].text as string;
       // First chunk must end with closing backticks
       expect(first.endsWith('```')).toBe(true);
       // Second chunk must start with opening backticks

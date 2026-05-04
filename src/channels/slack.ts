@@ -87,6 +87,7 @@ export class SlackChannel implements Channel {
   private app: App;
   private botToken = '';
   private botUserId: string | undefined;
+  private botBotId: string | undefined;
   private connected = false;
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
@@ -244,14 +245,18 @@ export class SlackChannel implements Channel {
 
       // Compute sender and mention data before the group check so they can
       // be used for cross-channel routing below.
-      const isFromMe = msg.user === this.botUserId;
+      const isFromMe =
+        msg.user === this.botUserId ||
+        (!!msg.bot_id && msg.bot_id === this.botBotId);
       const isBotMessage = !!msg.bot_id || isFromMe;
       const senderId = msg.user || '';
 
       // Translate Slack <@UBOTID> mentions into TRIGGER_PATTERN format.
+      // Skip for bot messages — they are already formatted and shouldn't be re-processed.
       let content = msg.text || '';
       const mentionToken = this.botUserId ? `<@${this.botUserId}>` : null;
       if (
+        !isBotMessage &&
         mentionToken &&
         content.includes(mentionToken) &&
         !TRIGGER_PATTERN.test(content)
@@ -477,6 +482,7 @@ export class SlackChannel implements Channel {
     try {
       const auth = await this.app.client.auth.test();
       this.botUserId = auth.user_id as string;
+      this.botBotId = auth.bot_id as string;
       logger.info({ botUserId: this.botUserId }, 'Connected to Slack');
     } catch (err) {
       logger.warn({ err }, 'Connected to Slack but failed to get bot user ID');
@@ -507,7 +513,10 @@ export class SlackChannel implements Channel {
       // Slack limits messages to ~4000 characters; split at line boundaries
       // and preserve code-block state across chunks
       for (const chunk of splitMessage(text)) {
-        await this.app.client.chat.postMessage({ channel: channelId, text: chunk });
+        await this.app.client.chat.postMessage({
+          channel: channelId,
+          text: chunk,
+        });
       }
       logger.info({ jid, length: text.length }, 'Slack message sent');
     } catch (err) {
