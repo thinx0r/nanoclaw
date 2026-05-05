@@ -366,19 +366,20 @@ export class SlackChannel implements Channel {
   /**
    * Download a private Slack file and return it as a base64-encoded Buffer.
    * Uses the bot token for authorization (Slack requires it for url_private URLs).
-   * Follows up to one redirect (Slack CDN URLs return 302).
+   * Follows up to one redirect — CDN URLs are pre-signed and must NOT carry the
+   * Authorization header (Slack returns an HTML error page if you send it).
    */
   private downloadFile(
     url: string,
-    followRedirect = true,
+    withAuth = true,
   ): Promise<Buffer | undefined> {
     return new Promise((resolve) => {
-      const req = https.get(
-        url,
-        { headers: { Authorization: `Bearer ${this.botToken}` } },
-        (res) => {
+      const opts = withAuth
+        ? { headers: { Authorization: `Bearer ${this.botToken}` } }
+        : {};
+      const req = https.get(url, opts, (res) => {
           if (
-            followRedirect &&
+            withAuth &&
             (res.statusCode === 301 || res.statusCode === 302) &&
             res.headers.location
           ) {
