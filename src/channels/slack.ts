@@ -63,6 +63,15 @@ const VALID_IMAGE_MIMES: ReadonlyArray<ValidImageMime> = [
   'image/webp',
 ];
 
+function isImageBuffer(buf: Buffer): boolean {
+  if (buf.length < 4) return false;
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return true; // PNG
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return true; // JPEG
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return true; // GIF
+  if (buf.length >= 12 && buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 && buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return true; // WebP
+  return false;
+}
+
 type ValidDocumentMime =
   | 'application/pdf'
   | 'text/plain'
@@ -378,30 +387,29 @@ export class SlackChannel implements Channel {
         ? { headers: { Authorization: `Bearer ${this.botToken}` } }
         : {};
       const req = https.get(url, opts, (res) => {
-          if (
-            withAuth &&
-            (res.statusCode === 301 || res.statusCode === 302) &&
-            res.headers.location
-          ) {
-            res.resume();
-            resolve(this.downloadFile(res.headers.location, false));
-            return;
-          }
-          if (res.statusCode !== 200) {
-            logger.warn(
-              { url, statusCode: res.statusCode },
-              'Slack file download failed — likely missing files:read scope',
-            );
-            res.resume();
-            resolve(undefined);
-            return;
-          }
-          const chunks: Buffer[] = [];
-          res.on('data', (chunk: Buffer) => chunks.push(chunk));
-          res.on('end', () => resolve(Buffer.concat(chunks)));
-          res.on('error', () => resolve(undefined));
-        },
-      );
+        if (
+          withAuth &&
+          (res.statusCode === 301 || res.statusCode === 302) &&
+          res.headers.location
+        ) {
+          res.resume();
+          resolve(this.downloadFile(res.headers.location, false));
+          return;
+        }
+        if (res.statusCode !== 200) {
+          logger.warn(
+            { url, statusCode: res.statusCode },
+            'Slack file download failed — likely missing files:read scope',
+          );
+          res.resume();
+          resolve(undefined);
+          return;
+        }
+        const chunks: Buffer[] = [];
+        res.on('data', (chunk: Buffer) => chunks.push(chunk));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+        res.on('error', () => resolve(undefined));
+      });
       req.on('error', (err) => {
         logger.warn({ url, err }, 'Slack file download request error');
         resolve(undefined);
@@ -426,6 +434,10 @@ export class SlackChannel implements Channel {
       try {
         const buf = await this.downloadFile(file.url_private);
         if (!buf) continue;
+        if (!isImageBuffer(buf)) {
+          logger.warn({ fileId: file.id, bytes: buf.length }, 'Slack image download returned non-image data — add files:read scope to the bot token');
+          continue;
+        }
         results.push({
           media_type: file.mimetype as ValidImageMime,
           data: buf.toString('base64'),
