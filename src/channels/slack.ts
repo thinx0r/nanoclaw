@@ -366,19 +366,32 @@ export class SlackChannel implements Channel {
   /**
    * Download a private Slack file and return it as a base64-encoded Buffer.
    * Uses the bot token for authorization (Slack requires it for url_private URLs).
+   * Follows up to one redirect (Slack CDN URLs return 302).
    */
-  private downloadFile(url: string): Promise<Buffer | undefined> {
+  private downloadFile(
+    url: string,
+    followRedirect = true,
+  ): Promise<Buffer | undefined> {
     return new Promise((resolve) => {
       const req = https.get(
         url,
         { headers: { Authorization: `Bearer ${this.botToken}` } },
         (res) => {
+          if (
+            followRedirect &&
+            (res.statusCode === 301 || res.statusCode === 302) &&
+            res.headers.location
+          ) {
+            res.resume();
+            resolve(this.downloadFile(res.headers.location, false));
+            return;
+          }
           if (res.statusCode !== 200) {
             logger.warn(
               { url, statusCode: res.statusCode },
               'Slack file download failed — likely missing files:read scope',
             );
-            res.resume(); // discard response body
+            res.resume();
             resolve(undefined);
             return;
           }
@@ -389,7 +402,7 @@ export class SlackChannel implements Channel {
         },
       );
       req.on('error', (err) => {
-        logger.debug({ url, err }, 'Slack file download request error');
+        logger.warn({ url, err }, 'Slack file download request error');
         resolve(undefined);
       });
     });
