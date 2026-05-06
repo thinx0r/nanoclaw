@@ -1,0 +1,8 @@
+{
+  "allowedRoots": [
+    { "path": "/opt/patchbox", "allowReadWrite": true },
+    { "path": "/opt/nanoclaw/drive", "allowReadWrite": true }
+  ],
+  "blockedPatterns": ["**/.env", "**/.git/config", "**/node_modules"],
+  "nonMainReadOnly": false
+}

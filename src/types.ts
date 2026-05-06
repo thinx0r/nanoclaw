@@ -60,6 +60,16 @@ export interface NewMessage {
     media_type: 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp';
     data: string; // base64-encoded
   }>;
+  /** Attached documents (PDFs, markdown, text — ephemeral, consumed by onMessage handler) */
+  documents?: Array<{
+    filename: string;
+    data: string; // base64-encoded
+    mime_type:
+      | 'application/pdf'
+      | 'text/plain'
+      | 'text/markdown'
+      | 'text/x-markdown';
+  }>;
 }
 
 export interface ScheduledTask {
@@ -100,6 +110,8 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: add emoji reaction to a specific message (messageId = platform message timestamp/id).
   addReaction?(jid: string, messageId: string, emoji: string): Promise<void>;
+  // Optional: remove emoji reaction from a specific message.
+  removeReaction?(jid: string, messageId: string, emoji: string): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
 }

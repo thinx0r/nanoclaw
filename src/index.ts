@@ -333,6 +333,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     return false;
   }
 
+  // Remove 👀 from all processed non-bot messages — task is done.
+  for (const m of missedMessages) {
+    if (!m.is_from_me && !m.is_bot_message) {
+      channel.removeReaction?.(chatJid, m.id, 'eyes').catch(() => {});
+    }
+  }
+
   return true;
 }
 
@@ -565,7 +572,19 @@ function recoverPendingMessages(): void {
 
 function ensureContainerSystemRunning(): void {
   ensureContainerRuntimeRunning();
-  cleanupOrphans();
+  // Read the group folder names from disk (DB not yet initialized at this point).
+  // This scopes orphan cleanup to only this bot's own containers so bots sharing
+  // the same Docker host don't kill each other's running containers on restart.
+  let ownedGroupFolders: string[] = [];
+  try {
+    ownedGroupFolders = fs
+      .readdirSync(GROUPS_DIR, { withFileTypes: true })
+      .filter((d) => d.isDirectory())
+      .map((d) => d.name);
+  } catch {
+    /* GROUPS_DIR missing — cleanupOrphans will skip safely */
+  }
+  cleanupOrphans(ownedGroupFolders);
 }
 
 async function main(): Promise<void> {
@@ -689,15 +708,60 @@ async function main(): Promise<void> {
                 paths.map((p) => `[Attached image: ${p}]`).join('\n');
             }
           } catch (err) {
-            logger.warn({ err, chatJid }, 'Failed to save Slack image attachment');
+            logger.warn(
+              { err, chatJid },
+              'Failed to save Slack image attachment',
+            );
+          }
+        }
+      }
+      // Save PDF attachments to the group's IPC dir (same pattern as images).
+      if (msg.documents?.length) {
+        const docGroup = registeredGroups[chatJid];
+        if (docGroup) {
+          const ipcDir = resolveGroupIpcPath(docGroup.folder);
+          const docsDir = path.join(ipcDir, 'input', 'documents');
+          try {
+            fs.mkdirSync(docsDir, { recursive: true });
+            const paths: string[] = [];
+            for (const doc of msg.documents) {
+              fs.writeFileSync(
+                path.join(docsDir, doc.filename),
+                Buffer.from(doc.data, 'base64'),
+              );
+              paths.push(`/workspace/ipc/input/documents/${doc.filename}`);
+            }
+            if (paths.length > 0) {
+              msg.content =
+                (msg.content ? msg.content + '\n' : '') +
+                paths.map((p) => `[Attached PDF: ${p}]`).join('\n');
+            }
+          } catch (err) {
+            logger.warn(
+              { err, chatJid },
+              'Failed to save Slack document attachment',
+            );
           }
         }
       }
       storeMessage(msg);
       if (!msg.is_from_me) {
-        findChannel(channels, chatJid)
-          ?.addReaction?.(chatJid, msg.id, 'eyes')
-          .catch((err) => logger.warn({ err, chatJid }, 'Failed to add seen reaction'));
+        // Only add 👀 if this message would actually trigger the bot.
+        // For groups with requiresTrigger, skip reaction on messages that don't match
+        // the trigger — avoids reacting to every message in a shared channel.
+        const grp = registeredGroups[chatJid];
+        const needsTriggerCheck =
+          grp && !grp.isMain && grp.requiresTrigger !== false;
+        const matchesTrigger =
+          !needsTriggerCheck ||
+          getTriggerPattern(grp.trigger).test(msg.content.trim());
+        if (matchesTrigger) {
+          findChannel(channels, chatJid)
+            ?.addReaction?.(chatJid, msg.id, 'eyes')
+            .catch((err) =>
+              logger.warn({ err, chatJid }, 'Failed to add seen reaction'),
+            );
+        }
       }
     },
     onChatMetadata: (

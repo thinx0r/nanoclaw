@@ -278,6 +278,7 @@ async function buildContainerArgs(
   const hostGid = process.getgid?.();
   if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
     args.push('--user', `${hostUid}:${hostGid}`);
+    args.push('--group-add', '1005');
     args.push('-e', 'HOME=/home/node');
   }
 

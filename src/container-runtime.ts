@@ -75,14 +75,39 @@ export function ensureContainerRuntimeRunning(): void {
   }
 }
 
-/** Kill orphaned NanoClaw containers from previous runs. */
-export function cleanupOrphans(): void {
+/**
+ * Kill orphaned NanoClaw containers from previous runs of THIS bot instance.
+ *
+ * Scoped to the provided group folder names so that bots sharing the same
+ * Docker host don't kill each other's running containers on restart.
+ * Container names follow the pattern nanoclaw-<safeName>-<timestamp> where
+ * safeName = folder.replace(/[^a-zA-Z0-9-]/g, '-').
+ */
+export function cleanupOrphans(ownedGroupFolders: string[] = []): void {
   try {
     const output = execSync(
       `${CONTAINER_RUNTIME_BIN} ps --filter name=nanoclaw- --format '{{.Names}}'`,
       { stdio: ['pipe', 'pipe', 'pipe'], encoding: 'utf-8' },
     );
-    const orphans = output.trim().split('\n').filter(Boolean);
+    const allContainers = output.trim().split('\n').filter(Boolean);
+
+    // Derive the set of name prefixes this bot owns.
+    // If no folders provided (safety fallback), skip cleanup rather than
+    // killing everything — that's safer than the old behaviour.
+    let orphans: string[];
+    if (ownedGroupFolders.length === 0) {
+      logger.warn(
+        'cleanupOrphans: no group folders provided, skipping cleanup',
+      );
+      return;
+    }
+    const prefixes = ownedGroupFolders.map(
+      (f) => `nanoclaw-${f.replace(/[^a-zA-Z0-9-]/g, '-')}-`,
+    );
+    orphans = allContainers.filter((name) =>
+      prefixes.some((prefix) => name.startsWith(prefix)),
+    );
+
     for (const name of orphans) {
       try {
         stopContainer(name);

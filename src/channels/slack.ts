@@ -65,10 +65,22 @@ const VALID_IMAGE_MIMES: ReadonlyArray<ValidImageMime> = [
 
 function isImageBuffer(buf: Buffer): boolean {
   if (buf.length < 4) return false;
-  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return true; // PNG
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47)
+    return true; // PNG
   if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return true; // JPEG
   if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return true; // GIF
-  if (buf.length >= 12 && buf[0] === 0x52 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x46 && buf[8] === 0x57 && buf[9] === 0x45 && buf[10] === 0x42 && buf[11] === 0x50) return true; // WebP
+  if (
+    buf.length >= 12 &&
+    buf[0] === 0x52 &&
+    buf[1] === 0x49 &&
+    buf[2] === 0x46 &&
+    buf[3] === 0x46 &&
+    buf[8] === 0x57 &&
+    buf[9] === 0x45 &&
+    buf[10] === 0x42 &&
+    buf[11] === 0x50
+  )
+    return true; // WebP
   return false;
 }
 
@@ -435,7 +447,10 @@ export class SlackChannel implements Channel {
         const buf = await this.downloadFile(file.url_private);
         if (!buf) continue;
         if (!isImageBuffer(buf)) {
-          logger.warn({ fileId: file.id, bytes: buf.length }, 'Slack image download returned non-image data — add files:read scope to the bot token');
+          logger.warn(
+            { fileId: file.id, bytes: buf.length },
+            'Slack image download returned non-image data — add files:read scope to the bot token',
+          );
           continue;
         }
         results.push({

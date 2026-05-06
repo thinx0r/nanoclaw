@@ -478,6 +478,7 @@ async function runQuery(
         'mcp__meta__*',
         'mcp__fleet_memory__*',
         'mcp__drive_sync__*',
+        'mcp__google_analytics__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -522,6 +523,11 @@ async function runQuery(
           command: 'node',
           args: [path.join(__dirname, 'drive-sync-mcp.js')],
           env: { ASSISTANT_NAME: containerInput.assistantName || process.env.ASSISTANT_NAME || '', NANOCLAW_GROUP_FOLDER: containerInput.groupFolder, NO_PROXY: "api.clickup.com" },
+        },
+        google_analytics: {
+          command: 'node',
+          args: [path.join(__dirname, 'google-analytics-mcp.js')],
+          env: { NANOCLAW_GROUP_FOLDER: containerInput.groupFolder, NO_PROXY: "api.clickup.com" },
         },
       },
       hooks: {
