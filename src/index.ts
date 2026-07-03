@@ -33,6 +33,7 @@ import {
   getAllChats,
   getAllRegisteredGroups,
   getAllSessions,
+  getSession,
   deleteSession,
   getAllTasks,
   getLastBotMessageTimestamp,
@@ -350,7 +351,17 @@ async function runAgent(
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.isMain === true;
-  const sessionId = sessions[group.folder];
+  let sessionId: string | undefined = sessions[group.folder];
+  // Re-validate against the DB: session-trim.sh deletes rotated sessions
+  // there, and resuming a trimmed session must start fresh instead.
+  if (sessionId && sessionId !== getSession(group.folder)) {
+    logger.info(
+      { group: group.folder, sessionId },
+      'Session was rotated externally, starting fresh',
+    );
+    delete sessions[group.folder];
+    sessionId = undefined;
+  }
 
   // Update tasks snapshot for container to read (filtered by group)
   const tasks = getAllTasks();

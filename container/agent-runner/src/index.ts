@@ -23,6 +23,11 @@ import {
   PreCompactHookInput,
 } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import {
+  getHonchoContext,
+  ingestHonchoExchange,
+  flushHoncho,
+} from './honcho-client.js';
 
 interface ContainerInput {
   prompt: string;
@@ -160,7 +165,10 @@ function getSessionSummary(
 }
 
 /**
- * Archive the full transcript to conversations/ before compaction.
+ * Archive the transcript to conversations/ before compaction.
+ * Incremental: a state file in conversations/ tracks how many messages per
+ * session were already archived, so each compaction only dumps the new tail
+ * instead of rewriting the full history every time.
  */
 function createPreCompactHook(assistantName?: string): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -177,29 +185,51 @@ function createPreCompactHook(assistantName?: string): HookCallback {
       const content = fs.readFileSync(transcriptPath, 'utf-8');
       const messages = parseTranscript(content);
 
-      if (messages.length === 0) {
-        log('No messages to archive');
+      const conversationsDir = '/workspace/group/conversations';
+      fs.mkdirSync(conversationsDir, { recursive: true });
+
+      const statePath = path.join(conversationsDir, '.precompact-state.json');
+      let archivedCounts: Record<string, number> = {};
+      try {
+        archivedCounts = JSON.parse(fs.readFileSync(statePath, 'utf-8'));
+      } catch {
+        archivedCounts = {};
+      }
+
+      let archived = archivedCounts[sessionId] ?? 0;
+      if (archived > messages.length) {
+        // Transcript was rotated/truncated externally — archive from the top.
+        archived = 0;
+      }
+      const newMessages = messages.slice(archived);
+
+      if (newMessages.length === 0) {
+        log('No new messages to archive');
         return {};
       }
 
       const summary = getSessionSummary(sessionId, transcriptPath);
       const name = summary ? sanitizeFilename(summary) : generateFallbackName();
 
-      const conversationsDir = '/workspace/group/conversations';
-      fs.mkdirSync(conversationsDir, { recursive: true });
-
-      const date = new Date().toISOString().split('T')[0];
-      const filename = `${date}-${name}.md`;
+      const now = new Date();
+      const date = now.toISOString().split('T')[0];
+      const time = `${now.getHours().toString().padStart(2, '0')}${now.getMinutes().toString().padStart(2, '0')}`;
+      const filename = `${date}-${time}-${name}.md`;
       const filePath = path.join(conversationsDir, filename);
 
       const markdown = formatTranscriptMarkdown(
-        messages,
+        newMessages,
         summary,
         assistantName,
       );
-      fs.writeFileSync(filePath, markdown);
+      fs.appendFileSync(filePath, markdown);
 
-      log(`Archived conversation to ${filePath}`);
+      archivedCounts[sessionId] = archived + newMessages.length;
+      fs.writeFileSync(statePath, JSON.stringify(archivedCounts));
+
+      log(
+        `Archived ${newMessages.length} new message(s) to ${filePath} (total ${archivedCounts[sessionId]})`,
+      );
     } catch (err) {
       log(
         `Failed to archive transcript: ${err instanceof Error ? err.message : String(err)}`,
@@ -422,34 +452,56 @@ async function runQuery(
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
-  // Discover additional directories mounted at /workspace/extra/*
-  // These are passed to the SDK so their CLAUDE.md files are loaded automatically
-  const extraDirs: string[] = [];
-  const extraBase = '/workspace/extra';
-  if (fs.existsSync(extraBase)) {
-    for (const entry of fs.readdirSync(extraBase)) {
-      const fullPath = path.join(extraBase, entry);
-      if (fs.statSync(fullPath).isDirectory()) {
-        extraDirs.push(fullPath);
+  // Quiet-Fleet: passively learned context from Honcho. Best-effort; '' if the
+  // memory layer is unreachable. Only for named non-main bots.
+  let honchoContext = '';
+  if (!containerInput.isMain && containerInput.assistantName) {
+    honchoContext = await getHonchoContext(
+      containerInput.assistantName,
+      prompt,
+      sessionId,
+    );
+  }
+  const appendContext = [globalClaudeMd, honchoContext]
+    .filter(Boolean)
+    .join('\n\n');
+
+  type ExtraDir = string | { path: string; readOnly?: boolean };
+  let extraDirs: ExtraDir[] = [];
+  const extraDirsConfigPath = '/workspace/project/extra-dirs.json';
+  if (fs.existsSync(extraDirsConfigPath)) {
+    try {
+      extraDirs = JSON.parse(fs.readFileSync(extraDirsConfigPath, 'utf-8')) as ExtraDir[];
+      log(`Extra dirs from config: ${JSON.stringify(extraDirs)}`);
+    } catch (e) {
+      log(`Failed to parse extra-dirs config: ${e}. Falling back.`);
+    }
+  }
+  if (extraDirs.length === 0) {
+    const extraBase = '/workspace/extra';
+    if (fs.existsSync(extraBase)) {
+      for (const entry of fs.readdirSync(extraBase)) {
+        const fullPath = path.join(extraBase, entry);
+        if (fs.statSync(fullPath).isDirectory()) { extraDirs.push(fullPath); }
       }
     }
   }
   if (extraDirs.length > 0) {
-    log(`Additional directories: ${extraDirs.join(', ')}`);
+    log(`Additional directories: ${extraDirs.map((d) => typeof d === 'string' ? d : d.path + (d.readOnly ? ' [readOnly]' : '')).join(', ')}`);
   }
 
   for await (const message of query({
     prompt: stream,
     options: {
       cwd: '/workspace/group',
-      additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
+      additionalDirectories: extraDirs.length > 0 ? extraDirs.map((d) => typeof d === 'string' ? d : d.path) : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
-      systemPrompt: globalClaudeMd
+      systemPrompt: appendContext
         ? {
             type: 'preset' as const,
             preset: 'claude_code' as const,
-            append: globalClaudeMd,
+            append: appendContext,
           }
         : undefined,
       allowedTools: [
@@ -476,6 +528,9 @@ async function runQuery(
         'mcp__slack__*',
         'mcp__openai__*',
         'mcp__meta__*',
+        'mcp__meta_adlibrary__*',
+        'mcp__google_adlibrary__*',
+        'mcp__google_sheets__*',
         'mcp__fleet_memory__*',
         'mcp__drive_sync__*',
         'mcp__google_analytics__*',
@@ -513,6 +568,21 @@ async function runQuery(
           command: 'node',
           args: [path.join(__dirname, 'meta-ads-mcp.js')],
           env: { META_ADS_TOKEN: (() => { try { return fs.readFileSync(`/workspace/extra/patchbox/.mcp-secrets/${containerInput.groupFolder}/meta-ads-token`, 'utf8').trim(); } catch { return ''; } })(), NANOCLAW_GROUP_FOLDER: containerInput.groupFolder, NO_PROXY: "api.clickup.com" },
+        },
+        meta_adlibrary: {
+          command: 'node',
+          args: [path.join(__dirname, 'meta-adlibrary-mcp.js')],
+          env: { META_ADLIBRARY_TOKEN: (() => { try { return fs.readFileSync(`/workspace/extra/patchbox/.mcp-secrets/${containerInput.groupFolder}/meta-adlibrary-token`, 'utf8').trim(); } catch { return ''; } })(), NANOCLAW_GROUP_FOLDER: containerInput.groupFolder, NO_PROXY: "api.clickup.com" },
+        },
+        google_adlibrary: {
+          command: 'node',
+          args: [path.join(__dirname, 'google-adlibrary-mcp.js')],
+          env: { GOOGLE_ADLIBRARY_KEY: (() => { try { return fs.readFileSync(`/workspace/extra/patchbox/.mcp-secrets/${containerInput.groupFolder}/google-adlibrary-key.json`, 'utf8'); } catch { return ''; } })(), NANOCLAW_GROUP_FOLDER: containerInput.groupFolder, NO_PROXY: "api.clickup.com" },
+        },
+        google_sheets: {
+          command: 'node',
+          args: [path.join(__dirname, 'google-sheets-mcp.js')],
+          env: { GOOGLE_SHEETS_KEY: (() => { try { return fs.readFileSync(`/workspace/extra/patchbox/.mcp-secrets/${containerInput.groupFolder}/google-sheets-key.json`, 'utf8'); } catch { return ''; } })(), GOOGLE_SHEETS_ALLOWED_IDS: (() => { try { return fs.readFileSync(`/workspace/extra/patchbox/.mcp-secrets/${containerInput.groupFolder}/google-sheets-allowed-ids`, 'utf8').trim(); } catch { return ''; } })(), NANOCLAW_GROUP_FOLDER: containerInput.groupFolder, NO_PROXY: "api.clickup.com" },
         },
         fleet_memory: {
           command: 'node',
@@ -579,6 +649,19 @@ async function runQuery(
         result: textResult || null,
         newSessionId,
       });
+
+      // Quiet-Fleet: passively ingest this exchange into Honcho (fire-and-forget).
+      if (!containerInput.isMain && containerInput.assistantName && textResult) {
+        const ingestSession = newSessionId || sessionId;
+        if (ingestSession) {
+          ingestHonchoExchange(
+            containerInput.assistantName,
+            ingestSession,
+            prompt,
+            textResult,
+          );
+        }
+      }
     }
   }
 
@@ -767,6 +850,8 @@ async function main(): Promise<void> {
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     log(`Agent error: ${errorMessage}`);
+    // Flush pending Honcho ingests before terminating (process.exit skips finally).
+    await flushHoncho();
     writeOutput({
       status: 'error',
       result: null,
@@ -774,6 +859,9 @@ async function main(): Promise<void> {
       error: errorMessage,
     });
     process.exit(1);
+  } finally {
+    // Normal-exit path: ensure passive learning POSTs land before container exits.
+    await flushHoncho();
   }
 }
 
