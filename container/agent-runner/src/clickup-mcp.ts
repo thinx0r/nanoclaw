@@ -63,6 +63,7 @@ const TOOLS = [
         description: { type: 'string', description: 'Task description (optional)' },
         status: { type: 'string', description: 'Task status (optional)' },
         priority: { type: 'number', description: '1=urgent, 2=high, 3=normal, 4=low (optional)' },
+        parent_id: { type: 'string', description: 'Parent task ID — creates this task as a subtask of the given parent (optional)' },
       },
       required: ['list_id', 'name'],
     },
@@ -109,6 +110,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<st
       if (args.description) body.description = args.description;
       if (args.status) body.status = args.status;
       if (args.priority) body.priority = args.priority;
+      if (args.parent_id) body.parent = args.parent_id;
       return JSON.stringify(await cu(`/list/${args.list_id}/task`, {
         method: 'POST',
         body: JSON.stringify(body),

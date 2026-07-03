@@ -27,6 +27,7 @@ import {
 } from './container-runtime.js';
 import { OneCLI } from '@onecli-sh/sdk';
 import { validateAdditionalMounts } from './mount-security.js';
+import { resolveSeat } from './seat-routing.js';
 import { RegisteredGroup } from './types.js';
 
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
@@ -247,25 +248,49 @@ async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   agentIdentifier?: string,
-): Promise<string[]> {
+): Promise<{ args: string[]; env: NodeJS.ProcessEnv }> {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
+  // Extra env handed to the docker client process (NOT to this orchestrator).
+  // Used to pass secrets via env-passthrough so they never appear in args/logs.
+  const env: NodeJS.ProcessEnv = {};
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // OneCLI gateway handles credential injection — containers never see real secrets.
-  // The gateway intercepts HTTPS traffic and injects API keys or OAuth tokens.
-  const onecliApplied = await onecli.applyContainerConfig(args, {
-    addHostMapping: false, // Nanoclaw already handles host gateway
-    agent: agentIdentifier,
-  });
-  if (onecliApplied) {
-    logger.info({ containerName }, 'OneCLI gateway config applied');
-  } else {
-    logger.warn(
-      { containerName },
-      'OneCLI gateway not reachable — container will have no credentials',
+  const seat = resolveSeat(agentIdentifier);
+  if (seat.mode === 'oauth' && seat.token) {
+    // Subscription seat: authenticate directly against Anthropic with the
+    // OAuth token and BYPASS the OneCLI gateway. We must not let OneCLI
+    // intercept HTTPS and overwrite auth with the API key.
+    //
+    // The token is passed by NAME only (`-e VAR`, no value); docker reads the
+    // value from this child's environment. That keeps the secret out of the
+    // container args, which get logged. Also clear any API-key/base-url that
+    // could otherwise shadow the OAuth token inside the container.
+    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN');
+    args.push('-e', 'ANTHROPIC_API_KEY=');
+    args.push('-e', 'ANTHROPIC_BASE_URL=');
+    env.CLAUDE_CODE_OAUTH_TOKEN = seat.token;
+    logger.info(
+      { containerName, agentIdentifier },
+      'Seat: OAuth subscription mode (OneCLI bypassed)',
     );
+  } else {
+    // Legacy: OneCLI gateway handles credential injection — containers never
+    // see real secrets. The gateway intercepts HTTPS traffic and injects API
+    // keys or OAuth tokens.
+    const onecliApplied = await onecli.applyContainerConfig(args, {
+      addHostMapping: false, // Nanoclaw already handles host gateway
+      agent: agentIdentifier,
+    });
+    if (onecliApplied) {
+      logger.info({ containerName }, 'OneCLI gateway config applied');
+    } else {
+      logger.warn(
+        { containerName },
+        'OneCLI gateway not reachable — container will have no credentials',
+      );
+    }
   }
 
   // Runtime-specific args for host gateway resolution
@@ -292,7 +317,7 @@ async function buildContainerArgs(
 
   args.push(CONTAINER_IMAGE);
 
-  return args;
+  return { args, env };
 }
 
 export async function runContainerAgent(
@@ -313,7 +338,7 @@ export async function runContainerAgent(
   const agentIdentifier = input.isMain
     ? undefined
     : group.folder.toLowerCase().replace(/_/g, '-');
-  const containerArgs = await buildContainerArgs(
+  const { args: containerArgs, env: containerEnv } = await buildContainerArgs(
     mounts,
     containerName,
     agentIdentifier,
@@ -348,6 +373,9 @@ export async function runContainerAgent(
   return new Promise((resolve) => {
     const container = spawn(CONTAINER_RUNTIME_BIN, containerArgs, {
       stdio: ['pipe', 'pipe', 'pipe'],
+      // containerEnv carries seat secrets (e.g. CLAUDE_CODE_OAUTH_TOKEN) into
+      // the docker client via env-passthrough; empty for legacy OneCLI mode.
+      env: { ...process.env, ...containerEnv },
     });
 
     onProcess(container, containerName);
