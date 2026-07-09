@@ -187,8 +187,16 @@ async function runTask(
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
-          // Forward result to user (sendMessage handles formatting)
-          await deps.sendMessage(task.chat_jid, streamedOutput.result);
+          if (streamedOutput.result.trim().startsWith('HEARTBEAT_OK')) {
+            // HEARTBEAT_OK convention: "nothing new" — log only, no channel post
+            logger.info(
+              { taskId: task.id },
+              'Task result HEARTBEAT_OK — channel post suppressed',
+            );
+          } else {
+            // Forward result to user (sendMessage handles formatting)
+            await deps.sendMessage(task.chat_jid, streamedOutput.result);
+          }
           scheduleClose();
         }
         if (streamedOutput.status === 'success') {
