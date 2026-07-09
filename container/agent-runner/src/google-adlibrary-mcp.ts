@@ -5,14 +5,16 @@
  *
  * Read-only competitor ad intelligence. Source = the materialized DWH tables in
  * `bytehub-1337.grw_dwh_us` (Location US), NOT the public BigQuery dataset:
- *   - d_competitor_creative          (1 row / creative — curated competitor attrs)
- *   - f_competitor_creative_region   (1 row / creative × region — flattened, no UNNEST)
- *   - vw_competitor_overview         (per-competitor rollup)
- * The competitor universe is curated centrally (Google Sheet → allowlist → DWH);
+ *   - d_competitor_creative            (1 row / creative — curated competitor attrs)
+ *   - f_competitor_creative_region     (1 row / creative × region — flattened, no UNNEST)
+ *   - vw_competitor_overview           (per-competitor rollup incl. last_refresh)
+ *   - vw_competitor_creatives_ranked   (ranked creatives: laufzeit, recency, impressions)
+ * The competitor universe is curated centrally (Google Sheet "Competitor Analysis"
+ * → BigQuery push → DWH refresh Mondays 06:00 UTC via sp_refresh_competitor_ads);
  * aim only READS — it never maintains its own list and never writes these tables.
  * Queries run in Location US and are BILLED to the SA's project (botland-494015).
  *
- * Tools: google_adlibrary_search, google_adlibrary_overview
+ * Tools: google_adlibrary_search, google_adlibrary_overview, google_adlibrary_top_creatives
  */
 
 import fs from 'fs';
@@ -36,9 +38,11 @@ const DWH = 'bytehub-1337.grw_dwh_us';
 const T_CREATIVE = `${DWH}.d_competitor_creative`;
 const T_REGION = `${DWH}.f_competitor_creative_region`;
 const V_OVERVIEW = `${DWH}.vw_competitor_overview`;
+const V_RANKED = `${DWH}.vw_competitor_creatives_ranked`;
 const QUERY_LOCATION = 'US';
-// Cost guard: a single query may never bill more than ~50 GB scanned.
-const MAX_BYTES_BILLED = String(50 * 1024 * 1024 * 1024);
+// Cost guard: the curated DWH tables are small (whole-view scans measure ~20 MB),
+// so 2 GB is generous headroom while still capping a runaway join hard.
+const MAX_BYTES_BILLED = String(2 * 1024 * 1024 * 1024);
 
 function b64url(buf: Buffer | string): string {
   return Buffer.from(buf).toString('base64').replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
@@ -183,6 +187,24 @@ const TOOLS = [
       required: [],
     },
   },
+  {
+    name: 'google_adlibrary_top_creatives',
+    description: 'Ranked competitor creatives from vw_competitor_creatives_ranked — the go-to tool for "top ads" and the weekly digest. Each row is one creative with curated produkt/competitor/priority, topic, format, laufzeit_tage (how long it has been running = proven performer proxy), tage_seit_letzter_schaltung (days since last shown = recency), impressions_max/impressions_summe (reach proxy), regionen (count of served regions) and creative_page_url (direct Transparency-Center link). Default ranking: longest-running creatives that were shown recently. Check data freshness first via google_adlibrary_overview (last_refresh; DWH refreshes Mondays 06:00 UTC).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        produkt: { type: 'string', description: 'Curated product line to match (case-insensitive substring), e.g. Patchdocs, Patchbox.' },
+        competitor: { type: 'string', description: 'Curated competitor name to match (case-insensitive substring).' },
+        priority: { type: 'string', description: 'Restrict to a curated priority tier (exact match).' },
+        ad_format_type: { type: 'string', description: 'Restrict to a creative format (exact match, e.g. TEXT / IMAGE / VIDEO).' },
+        recent_days: { type: 'number', description: 'Only creatives shown within the last N days (tage_seit_letzter_schaltung <= N). Default 7. Raise if the digest comes back empty.' },
+        min_laufzeit_tage: { type: 'number', description: 'Only creatives running at least N days (filters one-off tests).' },
+        order_by: { type: 'string', description: '"laufzeit" (default, longest-running first), "impressions" (highest reach first) or "recency" (most recently shown first).' },
+        limit: { type: 'number', description: 'Max rows to return (default 15, max 100).' },
+      },
+      required: [],
+    },
+  },
 ];
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<string> {
@@ -269,6 +291,62 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<st
         total_rows: rows.length,
         bytes_processed: res.totalBytesProcessed || null,
         competitors: rows,
+      }, null, 2);
+    }
+    case 'google_adlibrary_top_creatives': {
+      const rawLimit = typeof args.limit === 'number' ? args.limit : 15;
+      const limit = Math.min(Math.max(1, Math.floor(rawLimit)), 100);
+      const recentDays = typeof args.recent_days === 'number' && args.recent_days > 0
+        ? Math.floor(args.recent_days) : 7;
+
+      const where: string[] = ['tage_seit_letzter_schaltung <= @recent'];
+      const params: QueryParam[] = [
+        { name: 'recent', parameterType: { type: 'INT64' }, parameterValue: { value: String(recentDays) } },
+        { name: 'lim', parameterType: { type: 'INT64' }, parameterValue: { value: String(limit) } },
+      ];
+      const addLike = (col: string, pname: string, val: string) => {
+        where.push(`LOWER(${col}) LIKE @${pname}`);
+        params.push({ name: pname, parameterType: { type: 'STRING' }, parameterValue: { value: `%${val.toLowerCase()}%` } });
+      };
+      if (typeof args.produkt === 'string' && args.produkt.trim()) addLike('produkt', 'prod', args.produkt.trim());
+      if (typeof args.competitor === 'string' && args.competitor.trim()) addLike('competitor', 'comp', args.competitor.trim());
+      if (typeof args.priority === 'string' && args.priority.trim()) {
+        where.push('priority = @prio');
+        params.push({ name: 'prio', parameterType: { type: 'STRING' }, parameterValue: { value: args.priority.trim() } });
+      }
+      if (typeof args.ad_format_type === 'string' && args.ad_format_type.trim()) {
+        where.push('ad_format_type = @fmt');
+        params.push({ name: 'fmt', parameterType: { type: 'STRING' }, parameterValue: { value: args.ad_format_type.trim().toUpperCase() } });
+      }
+      if (typeof args.min_laufzeit_tage === 'number' && args.min_laufzeit_tage > 0) {
+        where.push('laufzeit_tage >= @minlauf');
+        params.push({ name: 'minlauf', parameterType: { type: 'INT64' }, parameterValue: { value: String(Math.floor(args.min_laufzeit_tage)) } });
+      }
+
+      const orderBy = args.order_by === 'impressions'
+        ? 'impressions_summe DESC'
+        : args.order_by === 'recency'
+          ? 'tage_seit_letzter_schaltung ASC, laufzeit_tage DESC'
+          : 'laufzeit_tage DESC';
+
+      const sql = `
+        SELECT
+          produkt, competitor, priority, ad_format_type, topic,
+          laufzeit_tage, tage_seit_letzter_schaltung, first_shown, last_shown,
+          regionen, impressions_max, impressions_summe,
+          advertiser_disclosed_name, creative_id, creative_page_url
+        FROM \`${V_RANKED}\`
+        WHERE ${where.join('\n          AND ')}
+        ORDER BY ${orderBy}
+        LIMIT @lim`;
+
+      const res = await bqQuery(sql, params);
+      const rows = shapeRows(res);
+      return JSON.stringify({
+        total_rows: rows.length,
+        recent_days_filter: recentDays,
+        bytes_processed: res.totalBytesProcessed || null,
+        creatives: rows,
       }, null, 2);
     }
     default:
