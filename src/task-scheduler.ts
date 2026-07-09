@@ -259,6 +259,14 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
   logger.info('Scheduler loop started');
 
   const loop = async () => {
+    // Liveness signal for the external watchdog: an idle bot writes no log
+    // lines, so log mtime cannot distinguish "quiet" from "hung". The
+    // watchdog checks this file's mtime instead of the log's.
+    try {
+      fs.writeFileSync('logs/heartbeat', new Date().toISOString());
+    } catch {
+      // logs/ missing (dev run) — never let the heartbeat kill the loop
+    }
     try {
       const dueTasks = getDueTasks();
       if (dueTasks.length > 0) {
