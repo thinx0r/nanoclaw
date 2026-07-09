@@ -36,3 +36,8 @@ groups/global/*
 .nanoclaw/
 
 agents-sdk-docs
+
+# Runtime/local artifacts — never auto-commit (2026-07-09)
+groups/
+*.bak-*
+.claude/settings.local.json
