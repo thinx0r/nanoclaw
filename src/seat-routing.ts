@@ -92,9 +92,8 @@ export function resolveSeat(agentIdentifier?: string): SeatResolution {
 
   const key = agentIdentifier ?? MAIN_KEY;
   const override = config.agents?.[key];
-  const mode: SeatMode = (override?.mode ?? config.mode) === 'oauth'
-    ? 'oauth'
-    : 'onecli';
+  const mode: SeatMode =
+    (override?.mode ?? config.mode) === 'oauth' ? 'oauth' : 'onecli';
   if (mode !== 'oauth') return { mode: 'onecli' };
 
   const tokenFile = override?.tokenFile ?? config.tokenFile;

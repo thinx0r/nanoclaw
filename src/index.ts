@@ -767,10 +767,18 @@ async function main(): Promise<void> {
           !needsTriggerCheck ||
           getTriggerPattern(grp.trigger).test(msg.content.trim());
         if (matchesTrigger) {
-          findChannel(channels, chatJid)
-            ?.addReaction?.(chatJid, msg.id, 'eyes')
+          // Cross-channel mentions carry the source channel in the content
+          // prefix; msg.id is a ts from THAT channel, so the reaction must
+          // target it — reacting on the main-group jid fails with
+          // message_not_found and the user sees no 👀.
+          const xchan = msg.content.match(
+            /^\[Cross-channel mention — reply in (slack:[A-Z0-9]+)\]/,
+          );
+          const reactJid = xchan ? xchan[1] : chatJid;
+          findChannel(channels, reactJid)
+            ?.addReaction?.(reactJid, msg.id, 'eyes')
             .catch((err) =>
-              logger.warn({ err, chatJid }, 'Failed to add seen reaction'),
+              logger.warn({ err, reactJid }, 'Failed to add seen reaction'),
             );
         }
       }
