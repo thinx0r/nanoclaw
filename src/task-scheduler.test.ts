@@ -109,7 +109,9 @@ describe('task scheduler', () => {
   });
 
   it('channelPostForResult suppresses internal-only results', () => {
-    expect(channelPostForResult('<internal>bookkeeping only</internal>')).toBeNull();
+    expect(
+      channelPostForResult('<internal>bookkeeping only</internal>'),
+    ).toBeNull();
   });
 
   it('channelPostForResult strips <internal> blocks from real posts', () => {

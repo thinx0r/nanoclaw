@@ -70,9 +70,7 @@ export function computeNextRun(task: ScheduledTask): string | null {
  * after stripping.
  */
 export function channelPostForResult(result: string): string | null {
-  const visible = result
-    .replace(/<internal>[\s\S]*?<\/internal>/gi, '')
-    .trim();
+  const visible = result.replace(/<internal>[\s\S]*?<\/internal>/gi, '').trim();
   if (!visible || visible.startsWith('HEARTBEAT_OK')) return null;
   return visible;
 }
