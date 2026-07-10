@@ -169,16 +169,27 @@ function buildVolumeMounts(
     );
   }
 
-  // Sync skills from container/skills/ into each group's .claude/skills/
-  const skillsSrc = path.join(process.cwd(), 'container', 'skills');
+  // Sync skills into each group's .claude/skills/ — runs on every container
+  // start, so skill updates in a source directory propagate automatically.
+  // Each synced skill dir is replaced wholesale (source is the SSoT for that
+  // skill); skills the agent created itself under other names are untouched.
   const skillsDst = path.join(groupSessionsDir, 'skills');
-  if (fs.existsSync(skillsSrc)) {
-    for (const skillDir of fs.readdirSync(skillsSrc)) {
-      const srcDir = path.join(skillsSrc, skillDir);
+  const syncSkills = (src: string) => {
+    if (!fs.existsSync(src)) return;
+    for (const skillDir of fs.readdirSync(src)) {
+      const srcDir = path.join(src, skillDir);
       if (!fs.statSync(srcDir).isDirectory()) continue;
       const dstDir = path.join(skillsDst, skillDir);
-      fs.cpSync(srcDir, dstDir, { recursive: true });
+      fs.rmSync(dstDir, { recursive: true, force: true });
+      fs.cpSync(srcDir, dstDir, { recursive: true, dereference: true });
     }
+  };
+  // Built-in skills shipped with NanoClaw
+  syncSkills(path.join(process.cwd(), 'container', 'skills'));
+  // Optional fleet-wide skills directory (e.g. a git-tracked ops repo shared
+  // by all bots). Synced second so fleet skills can override built-ins.
+  if (process.env.NANOCLAW_FLEET_SKILLS_DIR) {
+    syncSkills(process.env.NANOCLAW_FLEET_SKILLS_DIR);
   }
   mounts.push({
     hostPath: groupSessionsDir,
