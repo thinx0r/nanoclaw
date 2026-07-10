@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { _initTestDatabase, createTask, getTaskById } from './db.js';
 import {
   _resetSchedulerLoopForTests,
+  channelPostForResult,
   computeNextRun,
   startSchedulerLoop,
 } from './task-scheduler.js';
@@ -94,6 +95,33 @@ describe('task scheduler', () => {
     };
 
     expect(computeNextRun(task)).toBeNull();
+  });
+
+  it('channelPostForResult suppresses plain HEARTBEAT_OK results', () => {
+    expect(channelPostForResult('HEARTBEAT_OK - nichts Neues')).toBeNull();
+    expect(channelPostForResult('  HEARTBEAT_OK\n')).toBeNull();
+  });
+
+  it('channelPostForResult suppresses HEARTBEAT_OK preceded by <internal> blocks', () => {
+    const result =
+      '<internal>\nDrive pull: ✅\nScript: ✅ — 607 users\n</internal>\n\nHEARTBEAT_OK - synced';
+    expect(channelPostForResult(result)).toBeNull();
+  });
+
+  it('channelPostForResult suppresses internal-only results', () => {
+    expect(channelPostForResult('<internal>bookkeeping only</internal>')).toBeNull();
+  });
+
+  it('channelPostForResult strips <internal> blocks from real posts', () => {
+    const result =
+      '<internal>debug notes</internal>\nAlarm: 3 Fehler im Import.\n<internal>more notes</internal>';
+    expect(channelPostForResult(result)).toBe('Alarm: 3 Fehler im Import.');
+  });
+
+  it('channelPostForResult passes normal results through unchanged', () => {
+    expect(channelPostForResult('Report: alles grün.')).toBe(
+      'Report: alles grün.',
+    );
   });
 
   it('computeNextRun skips missed intervals without infinite loop', () => {

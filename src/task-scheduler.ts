@@ -62,6 +62,21 @@ export function computeNextRun(task: ScheduledTask): string | null {
   return null;
 }
 
+/**
+ * Derive the channel post from a task result. Strips <internal>…</internal>
+ * blocks (agents use them for status bookkeeping that must never reach the
+ * channel), then applies the HEARTBEAT_OK convention. Returns null when the
+ * post should be suppressed: HEARTBEAT_OK prefix, or nothing visible left
+ * after stripping.
+ */
+export function channelPostForResult(result: string): string | null {
+  const visible = result
+    .replace(/<internal>[\s\S]*?<\/internal>/gi, '')
+    .trim();
+  if (!visible || visible.startsWith('HEARTBEAT_OK')) return null;
+  return visible;
+}
+
 export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
   getSessions: () => Record<string, string>;
@@ -187,15 +202,16 @@ async function runTask(
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
-          if (streamedOutput.result.trim().startsWith('HEARTBEAT_OK')) {
-            // HEARTBEAT_OK convention: "nothing new" — log only, no channel post
+          const post = channelPostForResult(streamedOutput.result);
+          if (post === null) {
+            // HEARTBEAT_OK convention or internal-only result — log, no channel post
             logger.info(
               { taskId: task.id },
-              'Task result HEARTBEAT_OK — channel post suppressed',
+              'Task result suppressed (HEARTBEAT_OK or internal-only)',
             );
           } else {
             // Forward result to user (sendMessage handles formatting)
-            await deps.sendMessage(task.chat_jid, streamedOutput.result);
+            await deps.sendMessage(task.chat_jid, post);
           }
           scheduleClose();
         }
