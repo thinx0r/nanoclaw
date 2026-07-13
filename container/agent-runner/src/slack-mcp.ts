@@ -1,12 +1,73 @@
 /**
  * Slack MCP Server for NanoClaw
  * Dependency-free — uses native fetch (Node 18+)
- * Tools: add_reaction, remove_reaction
+ * Tools: add_reaction, remove_reaction, get_messages, get_thread_replies, post_message
  */
 
 import fs from 'fs';
 const _GROUP = process.env.NANOCLAW_GROUP_FOLDER || '';
 const TOKEN = process.env.SLACK_BOT_TOKEN || (() => { try { return fs.readFileSync(`/workspace/extra/patchbox/.mcp-secrets/${_GROUP}/slack-token`,'utf8').trim(); } catch { return ''; } })();
+
+// Accepts a Slack ts / epoch ("1749999999.000200"), an ISO date ("2026-06-01")
+// or ISO datetime and returns epoch seconds as string for oldest/latest params.
+function toSlackTs(v: string): string {
+  if (/^\d+(\.\d+)?$/.test(v)) return v;
+  const ms = Date.parse(v);
+  if (Number.isNaN(ms)) throw new Error(`Invalid date/timestamp: ${v} (use ISO date like 2026-06-01 or a Slack ts)`);
+  return String(ms / 1000);
+}
+
+interface SlackMessage {
+  ts?: string;
+  user?: string;
+  bot_id?: string;
+  username?: string;
+  text?: string;
+  thread_ts?: string;
+  reply_count?: number;
+  reactions?: Array<{ name?: string; count?: number }>;
+}
+interface HistoryPage {
+  messages?: SlackMessage[];
+  has_more?: boolean;
+  response_metadata?: { next_cursor?: string };
+}
+
+function compactMessage(m: SlackMessage) {
+  return {
+    ts: m.ts,
+    user: m.user || m.username || m.bot_id,
+    text: m.text,
+    ...(m.thread_ts ? { thread_ts: m.thread_ts } : {}),
+    ...(m.reply_count ? { reply_count: m.reply_count } : {}),
+    ...(m.reactions?.length ? { reactions: m.reactions.map(r => ({ name: r.name, count: r.count })) } : {}),
+  };
+}
+
+// Pages through conversations.history/replies until `total` messages are
+// collected or the window is exhausted. Slack caps limit at ~200 per page.
+async function fetchPaged(method: string, base: Record<string, string>, total: number, startCursor?: string): Promise<string> {
+  const messages: SlackMessage[] = [];
+  let cursor = startCursor || '';
+  let hasMore = false;
+  while (messages.length < total) {
+    const page = await slackApi(method, {
+      ...base,
+      limit: String(Math.min(total - messages.length, 200)),
+      ...(cursor ? { cursor } : {}),
+    }) as HistoryPage;
+    messages.push(...(page.messages || []));
+    cursor = page.response_metadata?.next_cursor || '';
+    hasMore = Boolean(page.has_more && cursor);
+    if (!hasMore) break;
+  }
+  return JSON.stringify({
+    message_count: messages.length,
+    has_more: hasMore,
+    ...(hasMore ? { next_cursor: cursor } : {}),
+    messages: messages.map(compactMessage),
+  }, null, 2);
+}
 
 async function slackApi(method: string, body: Record<string, string>): Promise<unknown> {
   const res = await fetch(`https://slack.com/api/${method}`, {
@@ -35,14 +96,31 @@ const TOOLS = [
   },
   {
     name: 'slack_get_messages',
-    description: 'Get recent messages from a Slack channel or DM, including timestamps for reactions',
+    description: 'Get messages from a Slack channel or DM (newest first). Supports the FULL channel history: use oldest/latest to set a time window (ISO date or Slack ts) and limit up to 1000 messages per call; pages internally. Returns compact messages (ts, user, text, thread_ts, reply_count, reactions) — use slack_get_thread_replies for thread contents.',
     inputSchema: {
       type: 'object',
       properties: {
         channel: { type: 'string', description: 'Channel ID (e.g. C... or D...)' },
-        limit: { type: 'number', description: 'Number of messages to retrieve (default 10, max 50)' },
+        limit: { type: 'number', description: 'Max messages to retrieve (default 50, max 1000)' },
+        oldest: { type: 'string', description: 'Only messages after this point — ISO date (2026-06-01), ISO datetime, or Slack ts (optional)' },
+        latest: { type: 'string', description: 'Only messages before this point — same formats as oldest (optional)' },
+        cursor: { type: 'string', description: 'Pagination cursor from a previous call\'s next_cursor (optional)' },
       },
       required: ['channel'],
+    },
+  },
+  {
+    name: 'slack_get_thread_replies',
+    description: 'Get all replies of a Slack thread (thread replies do NOT appear in channel history). Pass the parent message ts as thread_ts.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        channel: { type: 'string', description: 'Channel ID (e.g. C... or D...)' },
+        thread_ts: { type: 'string', description: 'Timestamp of the thread parent message' },
+        limit: { type: 'number', description: 'Max messages to retrieve (default 100, max 1000)' },
+        cursor: { type: 'string', description: 'Pagination cursor from a previous call\'s next_cursor (optional)' },
+      },
+      required: ['channel', 'thread_ts'],
     },
   },
   {
@@ -78,8 +156,15 @@ async function callTool(name: string, args: Record<string, string>): Promise<str
     case 'slack_add_reaction':
       return JSON.stringify(await slackApi('reactions.add', { channel: args.channel, timestamp: args.timestamp, name: args.emoji }), null, 2);
     case 'slack_get_messages': {
-      const limit = Math.min(Number(args.limit) || 10, 50);
-      return JSON.stringify(await slackApi('conversations.history', { channel: args.channel, limit: String(limit) }), null, 2);
+      const total = Math.min(Number(args.limit) || 50, 1000);
+      const base: Record<string, string> = { channel: args.channel };
+      if (args.oldest) base.oldest = toSlackTs(args.oldest);
+      if (args.latest) base.latest = toSlackTs(args.latest);
+      return fetchPaged('conversations.history', base, total, args.cursor);
+    }
+    case 'slack_get_thread_replies': {
+      const total = Math.min(Number(args.limit) || 100, 1000);
+      return fetchPaged('conversations.replies', { channel: args.channel, ts: args.thread_ts }, total, args.cursor);
     }
     case 'slack_remove_reaction':
       return JSON.stringify(await slackApi('reactions.remove', { channel: args.channel, timestamp: args.timestamp, name: args.emoji }), null, 2);
