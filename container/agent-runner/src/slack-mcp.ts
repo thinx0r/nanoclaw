@@ -1,7 +1,7 @@
 /**
  * Slack MCP Server for NanoClaw
  * Dependency-free — uses native fetch (Node 18+)
- * Tools: add_reaction, remove_reaction, get_messages, get_thread_replies, post_message
+ * Tools: add_reaction, remove_reaction, get_messages, get_thread_replies, post_message, get_user_info
  */
 
 import fs from 'fs';
@@ -67,6 +67,16 @@ async function fetchPaged(method: string, base: Record<string, string>, total: n
     ...(hasMore ? { next_cursor: cursor } : {}),
     messages: messages.map(compactMessage),
   }, null, 2);
+}
+
+// GET variant for read methods that don't accept JSON bodies (e.g. users.info).
+async function slackApiGet(method: string, params: Record<string, string>): Promise<unknown> {
+  const res = await fetch(`https://slack.com/api/${method}?${new URLSearchParams(params)}`, {
+    headers: { Authorization: `Bearer ${TOKEN}` },
+  });
+  const data = await res.json() as { ok: boolean; error?: string };
+  if (!data.ok) throw new Error(`Slack API error: ${data.error}`);
+  return data;
 }
 
 async function slackApi(method: string, body: Record<string, string>): Promise<unknown> {
@@ -137,6 +147,17 @@ const TOOLS = [
     },
   },
   {
+    name: 'slack_get_user_info',
+    description: 'Resolve Slack user IDs to real names (users.info). Pass one or more comma-separated user IDs; returns id, real_name, display_name (plus is_bot/deleted flags) per user. IDs that cannot be resolved come back with an error field — in that case show the raw <@ID> mention in your output and say the name could not be resolved. NEVER guess or invent a name.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        user_ids: { type: 'string', description: 'One or more Slack user IDs, comma-separated (e.g. "U02RY0M2L,U078XREKBNZ"). Max 100 per call.' },
+      },
+      required: ['user_ids'],
+    },
+  },
+  {
     name: 'slack_post_message',
     description: 'Post a message to a Slack channel or DM',
     inputSchema: {
@@ -168,6 +189,28 @@ async function callTool(name: string, args: Record<string, string>): Promise<str
     }
     case 'slack_remove_reaction':
       return JSON.stringify(await slackApi('reactions.remove', { channel: args.channel, timestamp: args.timestamp, name: args.emoji }), null, 2);
+    case 'slack_get_user_info': {
+      const ids = args.user_ids.split(',').map(s => s.trim()).filter(Boolean).slice(0, 100);
+      const users = [];
+      for (const id of ids) {
+        try {
+          const data = await slackApiGet('users.info', { user: id }) as {
+            user?: { name?: string; real_name?: string; deleted?: boolean; is_bot?: boolean; profile?: { display_name?: string; real_name?: string } };
+          };
+          const u = data.user || {};
+          users.push({
+            id,
+            real_name: u.real_name || u.profile?.real_name || null,
+            display_name: u.profile?.display_name || u.name || null,
+            ...(u.is_bot ? { is_bot: true } : {}),
+            ...(u.deleted ? { deleted: true } : {}),
+          });
+        } catch (err) {
+          users.push({ id, error: err instanceof Error ? err.message : String(err) });
+        }
+      }
+      return JSON.stringify({ users }, null, 2);
+    }
     case 'slack_post_message': {
       const body: Record<string, string> = { channel: args.channel, text: args.text };
       if (args.thread_ts) body.thread_ts = args.thread_ts;

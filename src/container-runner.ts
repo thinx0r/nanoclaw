@@ -225,15 +225,25 @@ function buildVolumeMounts(
     'agent-runner-src',
   );
   if (fs.existsSync(agentRunnerSrc)) {
-    const srcIndex = path.join(agentRunnerSrc, 'index.ts');
-    const cachedIndex = path.join(groupAgentRunnerDir, 'index.ts');
-    const needsCopy =
-      !fs.existsSync(groupAgentRunnerDir) ||
-      !fs.existsSync(cachedIndex) ||
-      (fs.existsSync(srcIndex) &&
-        fs.statSync(srcIndex).mtimeMs > fs.statSync(cachedIndex).mtimeMs);
-    if (needsCopy) {
-      fs.cpSync(agentRunnerSrc, groupAgentRunnerDir, { recursive: true });
+    // Per-file sync: copy each canonical source file whose cached copy is
+    // missing or older. Keying the whole-dir copy on index.ts alone left
+    // stale tool files behind when only an MCP file changed (slack-mcp.ts
+    // 2026-07-13), and cpSync clobbered per-group customizations of files
+    // that hadn't changed upstream.
+    fs.mkdirSync(groupAgentRunnerDir, { recursive: true });
+    for (const entry of fs.readdirSync(agentRunnerSrc)) {
+      const srcFile = path.join(agentRunnerSrc, entry);
+      if (!fs.statSync(srcFile).isFile()) continue;
+      const destFile = path.join(groupAgentRunnerDir, entry);
+      if (
+        !fs.existsSync(destFile) ||
+        fs.statSync(srcFile).mtimeMs > fs.statSync(destFile).mtimeMs
+      ) {
+        // rm first: some cached files are hardlinks to the canonical source;
+        // copying onto the same inode would truncate the original.
+        fs.rmSync(destFile, { force: true });
+        fs.copyFileSync(srcFile, destFile);
+      }
     }
   }
   mounts.push({
