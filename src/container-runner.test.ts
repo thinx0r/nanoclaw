@@ -228,3 +228,86 @@ describe('container-runner timeout behavior', () => {
     expect(result.newSessionId).toBe('session-456');
   });
 });
+
+describe('checkPersonaReadable (persona guard)', () => {
+  // Uses real fs (only specific fns are stubbed in the module mock above);
+  // access(R_OK) is a no-op for root, so these tests require a non-root uid.
+  const asNonRoot = it.skipIf(process.getuid?.() === 0);
+  let realFs: typeof import('fs');
+  let tmp: string;
+
+  beforeEach(async () => {
+    realFs = await vi.importActual<typeof import('fs')>('fs');
+    tmp = realFs.mkdtempSync('/tmp/persona-guard-test-');
+  });
+
+  afterEach(() => {
+    realFs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('returns null when no CLAUDE.md is wired', async () => {
+    const { checkPersonaReadable } = await import('./container-runner.js');
+    expect(checkPersonaReadable(tmp, [])).toBeNull();
+  });
+
+  it('returns null for a readable regular CLAUDE.md', async () => {
+    const { checkPersonaReadable } = await import('./container-runner.js');
+    realFs.writeFileSync(`${tmp}/CLAUDE.md`, '# persona');
+    expect(checkPersonaReadable(tmp, [])).toBeNull();
+  });
+
+  it('translates /workspace symlinks through the mount table', async () => {
+    const { checkPersonaReadable } = await import('./container-runner.js');
+    realFs.mkdirSync(`${tmp}/repo/agents/kim`, { recursive: true });
+    realFs.writeFileSync(`${tmp}/repo/agents/kim/CLAUDE.md`, '# persona');
+    realFs.mkdirSync(`${tmp}/group`);
+    realFs.symlinkSync(
+      '/workspace/extra/patchbox/agents/kim/CLAUDE.md',
+      `${tmp}/group/CLAUDE.md`,
+    );
+    const mounts = [
+      {
+        hostPath: `${tmp}/repo`,
+        containerPath: '/workspace/extra/patchbox',
+        readonly: false,
+      },
+    ];
+    expect(checkPersonaReadable(`${tmp}/group`, mounts)).toBeNull();
+  });
+
+  asNonRoot(
+    'reports an unreadable persona target (the 2026-07 incident class)',
+    async () => {
+      const { checkPersonaReadable } = await import('./container-runner.js');
+      realFs.mkdirSync(`${tmp}/repo`);
+      realFs.writeFileSync(`${tmp}/repo/CLAUDE.md`, '# persona');
+      realFs.chmodSync(`${tmp}/repo/CLAUDE.md`, 0o000);
+      realFs.mkdirSync(`${tmp}/group`);
+      realFs.symlinkSync(
+        '/workspace/extra/patchbox/CLAUDE.md',
+        `${tmp}/group/CLAUDE.md`,
+      );
+      const mounts = [
+        {
+          hostPath: `${tmp}/repo`,
+          containerPath: '/workspace/extra/patchbox',
+          readonly: false,
+        },
+      ];
+      const issue = checkPersonaReadable(`${tmp}/group`, mounts);
+      expect(issue).toContain('not readable');
+      expect(issue).toContain('EACCES');
+    },
+  );
+
+  it('reports a symlink with no matching mount (would dangle)', async () => {
+    const { checkPersonaReadable } = await import('./container-runner.js');
+    realFs.mkdirSync(`${tmp}/group`);
+    realFs.symlinkSync(
+      '/workspace/extra/unmounted/CLAUDE.md',
+      `${tmp}/group/CLAUDE.md`,
+    );
+    const issue = checkPersonaReadable(`${tmp}/group`, []);
+    expect(issue).toContain('matches no configured mount');
+  });
+});

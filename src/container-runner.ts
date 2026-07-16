@@ -341,6 +341,91 @@ async function buildContainerArgs(
   return { args, env };
 }
 
+/**
+ * Persona guard: the group's CLAUDE.md is read INSIDE the container by Claude
+ * Code itself, which silently skips unreadable files — the bot then runs as a
+ * persona-less generic session and keeps answering users (incident
+ * 2026-07-10..16: host edits reset the file group, EACCES in the container,
+ * nearly the whole fleet ran without identity for six days, unnoticed).
+ *
+ * This orchestrator runs as the same uid the container gets (--user), so an
+ * access check here mirrors exactly what the agent will see. Symlinks that
+ * point at container paths (/workspace/...) are translated back to host paths
+ * via the mount table. Returns a problem description, or null when the
+ * persona is readable — or when no CLAUDE.md is wired at all, which is a
+ * legitimate template-group state.
+ */
+export function checkPersonaReadable(
+  groupDir: string,
+  mounts: VolumeMount[],
+): string | null {
+  const claudeMd = path.join(groupDir, 'CLAUDE.md');
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(claudeMd);
+  } catch {
+    return null;
+  }
+  let target = claudeMd;
+  if (st.isSymbolicLink()) {
+    const link = fs.readlinkSync(claudeMd);
+    if (link.startsWith('/workspace/')) {
+      const mount = mounts
+        .filter(
+          (m) =>
+            link === m.containerPath ||
+            link.startsWith(m.containerPath + '/'),
+        )
+        .sort((a, b) => b.containerPath.length - a.containerPath.length)[0];
+      if (!mount) {
+        return `CLAUDE.md symlink -> ${link} matches no configured mount (persona would dangle in the container)`;
+      }
+      target = path.join(
+        mount.hostPath,
+        path.relative(mount.containerPath, link),
+      );
+    } else {
+      target = path.resolve(path.dirname(claudeMd), link);
+    }
+  }
+  try {
+    fs.accessSync(target, fs.constants.R_OK);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? 'unknown';
+    return `CLAUDE.md (${target}) not readable as uid ${process.getuid?.()}: ${code}`;
+  }
+  return null;
+}
+
+/**
+ * Best-effort alert so persona failures surface immediately instead of via
+ * confused users. Channel comes from NANOCLAW_ALERT_CHANNEL (systemd drop-in);
+ * without it the ERROR log entry is the only signal.
+ */
+async function sendPersonaAlert(
+  groupName: string,
+  issue: string,
+): Promise<void> {
+  const channel = process.env.NANOCLAW_ALERT_CHANNEL;
+  const token = process.env.SLACK_BOT_TOKEN;
+  if (!channel || !token) return;
+  try {
+    await fetch('https://slack.com/api/chat.postMessage', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        channel,
+        text: `:rotating_light: Persona-Guard: *${groupName}* — ${issue}. Container-Start verweigert, Bot antwortet NICHT persona-los. Fix prüfen mit persona-lint.sh`,
+      }),
+    });
+  } catch (err) {
+    logger.warn({ err }, 'Persona alert delivery failed');
+  }
+}
+
 export async function runContainerAgent(
   group: RegisteredGroup,
   input: ContainerInput,
@@ -353,6 +438,22 @@ export async function runContainerAgent(
   fs.mkdirSync(groupDir, { recursive: true });
 
   const mounts = buildVolumeMounts(group, input.isMain);
+
+  // Fail loud, not silently degraded: a wired-but-unreadable persona blocks
+  // the session instead of letting the bot improvise without its identity.
+  const personaIssue = checkPersonaReadable(groupDir, mounts);
+  if (personaIssue) {
+    logger.error(
+      { group: group.name, folder: group.folder, personaIssue },
+      'Persona unreadable — refusing to start persona-less session',
+    );
+    void sendPersonaAlert(group.name, personaIssue);
+    return {
+      status: 'error',
+      result: null,
+      error: `Persona check failed: ${personaIssue}`,
+    };
+  }
   const safeName = group.folder.replace(/[^a-zA-Z0-9-]/g, '-');
   const containerName = `nanoclaw-${safeName}-${Date.now()}`;
   // Main group uses the default OneCLI agent; others use their own agent.
