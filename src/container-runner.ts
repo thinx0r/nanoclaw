@@ -373,8 +373,7 @@ export function checkPersonaReadable(
       const mount = mounts
         .filter(
           (m) =>
-            link === m.containerPath ||
-            link.startsWith(m.containerPath + '/'),
+            link === m.containerPath || link.startsWith(m.containerPath + '/'),
         )
         .sort((a, b) => b.containerPath.length - a.containerPath.length)[0];
       if (!mount) {
