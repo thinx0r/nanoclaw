@@ -42,7 +42,7 @@ if (!SELF) {
 
 // Known bots the host processor understands. Keep in sync with the
 // LOCAL_DIR map in setup/scripts/drive-sync-processor.sh.
-const KNOWN_BOTS = new Set(['aiden', 'aim', 'kim', 'kirsten', 'sheldon']);
+const KNOWN_BOTS = new Set(['aiden', 'aim', 'dr-data', 'kim', 'kirsten', 'sheldon']);
 if (!KNOWN_BOTS.has(SELF)) {
     process.stderr.write(`[drive-sync-mcp] FATAL: ASSISTANT_NAME="${SELF}" is not in the known-bots list; update drive-sync-processor.sh and drive-sync-mcp.ts together\n`);
     process.exit(2);
